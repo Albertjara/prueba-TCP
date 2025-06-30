@@ -12,7 +12,7 @@ HOST = '0.0.0.0'
 # Railway te asignará un puerto dinámicamente a través de la variable de entorno 'PORT'.
 # Por eso usamos os.environ.get('PORT'). Si no está definida (por ejemplo, cuando pruebas localmente),
 # usará el puerto 12345 por defecto. ESTE SERÁ TU "PUERTO FIJO" INTERNO.
-PORT = int(os.environ.get('PORT', 12345))
+PORT = int(os.environ.get('PORT', 5432))
 
 # TIMEOUT_IN_SECONDS: Tiempo máximo que una conexión estará inactiva (sin recibir datos)
 # antes de que el servidor la cierre. 30 minutos = 30 * 60 segundos.
