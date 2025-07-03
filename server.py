@@ -43,7 +43,7 @@ def handle_client(conn, addr):
             # --- Aquí es donde ANALIZARÁS Y PROCESARÁS la data ---
             # Los datos que recibes (data) son bytes. Para poder leerlos como texto, necesitas decodificarlos.
             # 'utf-8' es una codificación de texto muy común. Si tu equipo envía datos con otra, cámbiala aquí.
-            decoded_data = data.decode('utf-8') 
+            decoded_data = data.decode('utf-8').strip() 
             print(f"[DATOS RECIBIDOS de {addr}] {decoded_data}")
             
             # EJEMPLO DE ANÁLISIS BÁSICO:
