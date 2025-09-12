@@ -4,8 +4,11 @@ import os
 import time
 
 # --- Configuración del Servidor ---
+# HOST: '0.0.0.0' significa que el servidor escuchará en TODAS las direcciones IP disponibles.
 HOST = '0.0.0.0'
+# PORT: Se obtiene dinámicamente de Railway o usa 5432 por defecto para pruebas locales.
 PORT = int(os.environ.get('PORT', 5432))
+# TIMEOUT_IN_SECONDS: Tiempo máximo que una conexión estará inactiva antes de cerrarse.
 TIMEOUT_IN_SECONDS = 30 * 60 # 30 minutos
 
 # --- Función para Des-escapar Bytes JT/T 808 ---
@@ -33,10 +36,10 @@ def unescape_jt808(data_bytes_with_delimiters):
                     unescaped_bytes.append(0x7e)
                     i += 2
                 else:
-                    unescaped_bytes.append(0x7d)
+                    unescaped_bytes.append(data_to_unescape[i])
                     i += 1
             else:
-                unescaped_bytes.append(0x7d)
+                unescaped_bytes.append(data_to_unescape[i])
                 i += 1
         else:
             unescaped_bytes.append(data_to_unescape[i])
@@ -105,6 +108,7 @@ def handle_client(conn, addr):
             terminal_phone_number_str = "".join([f"{b:02x}" for b in terminal_phone_number_raw])
             print(f"  --> Teléfono Terminal (BCD): {terminal_phone_number_str}")
             
+            # Nota: Según los logs, el número de serie parece ser Little-Endian.
             message_serial_number = int.from_bytes(message_serial_number_raw, 'little') 
             print(f"  --> Número de Serie: {message_serial_number} (raw: {message_serial_number_raw.hex()})")
             
@@ -113,20 +117,34 @@ def handle_client(conn, addr):
             # --- Lógica de Respuesta mejorada ---
             response_message_id = None
             response_result = 0x00 # 0x00 para éxito por defecto
+            response_body = b''
 
             if message_id == 0x0100: # Mensaje de Registro del Terminal
                 print("  --> Tipo de Mensaje: REGISTRO DE TERMINAL (0x0100)")
-                # Aquí parsearías los detalles del registro como matrícula, etc.
-                response_message_id = 0x8100 # Respuesta específica de registro
+                # Aquí puedes añadir lógica para registrar el terminal en una base de datos.
+                # El código de autenticación es solo un ejemplo.
+                auth_code = b"AUTH_CODE_2025_ABCD"
+                
+                # Construir el cuerpo de la respuesta 0x8100
+                response_message_id = 0x8100
+                response_body = message_serial_number_raw + response_result.to_bytes(1, 'big')
+                
+                # Si el resultado es éxito, se añade el código de autenticación
+                if response_result == 0x00:
+                    response_body += auth_code
 
             elif message_id == 0x0002: # Terminal Heartbeat (Mensaje de latido)
                 print("  --> Tipo de Mensaje: HEARTBEAT (0x0002)")
-                response_message_id = 0x8001 # Respuesta general
+                # Construir el cuerpo de la respuesta 0x8001
+                response_message_id = 0x8001
+                response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
 
             elif message_id == 0x0200: # Reporte de Información de Posición
                 print("  --> Tipo de Mensaje: REPORTE DE POSICIÓN (0x0200)")
-                # Aquí parsearías la posición, velocidad, etc.
-                response_message_id = 0x8001 # Respuesta general
+                # Aquí puedes parsear los datos de posición (lat, lon, etc.).
+                # Construir el cuerpo de la respuesta 0x8001
+                response_message_id = 0x8001
+                response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
 
             else:
                 print(f"  --> Tipo de Mensaje: ID DESCONOCIDO {hex(message_id)}")
@@ -135,12 +153,6 @@ def handle_client(conn, addr):
             
             # Construir y enviar la respuesta si se identificó una
             if response_message_id:
-                if response_message_id == 0x8100:
-                    # Cuerpo del mensaje 0x8100 (Respuesta de registro)
-                    response_body = message_serial_number_raw + response_result.to_bytes(1, 'big')
-                else: # Para 0x8001 (Respuesta general)
-                    response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
-
                 response_body_len = len(response_body)
                 response_attributes = (response_body_len & 0x03FF).to_bytes(2, 'big')
                 
@@ -175,6 +187,9 @@ def handle_client(conn, addr):
 
 # --- Función para Iniciar el Servidor Principal ---
 def start_server():
+    """
+    Esta función inicia el servidor y espera nuevas conexiones.
+    """
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
