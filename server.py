@@ -4,11 +4,8 @@ import os
 import time
 
 # --- Configuración del Servidor ---
-# HOST: '0.0.0.0' significa que el servidor escuchará en TODAS las direcciones IP disponibles.
 HOST = '0.0.0.0'
-# PORT: Se obtiene dinámicamente de Railway o usa 5432 por defecto para pruebas locales.
 PORT = int(os.environ.get('PORT', 5432))
-# TIMEOUT_IN_SECONDS: Tiempo máximo que una conexión estará inactiva antes de cerrarse.
 TIMEOUT_IN_SECONDS = 30 * 60 # 30 minutos
 
 # --- Función para Des-escapar Bytes JT/T 808 ---
@@ -92,7 +89,7 @@ def handle_client(conn, addr):
             message_id = int.from_bytes(payload_for_checksum[0:2], 'big')
             message_body_attributes = int.from_bytes(payload_for_checksum[2:4], 'big')
             terminal_phone_number_raw = payload_for_checksum[4:10]
-            message_serial_number_raw = payload[10:12]
+            message_serial_number_raw = payload_for_checksum[10:12]
 
             body_length = message_body_attributes & 0x03FF 
 
@@ -133,9 +130,6 @@ def handle_client(conn, addr):
                 authentication_code_received = message_body.decode('gbk')
                 print(f"  --> Código de Autenticación Recibido: {authentication_code_received}")
                 
-                # Aquí puedes comparar el código recibido con el que generaste en el registro
-                
-                # La respuesta a este mensaje es una respuesta general (0x8001)
                 response_message_id = 0x8001
                 response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
 
@@ -146,7 +140,6 @@ def handle_client(conn, addr):
                 print(f"  --> Responde a la consulta con serial {response_serial_number_for_query}")
                 print(f"  --> Total de parámetros recibidos: {num_parameters}")
                 
-                # Parsear la lista de parámetros
                 current_byte = 3
                 for _ in range(num_parameters):
                     param_id = int.from_bytes(message_body[current_byte:current_byte+4], 'big')
@@ -155,7 +148,6 @@ def handle_client(conn, addr):
                     
                     print(f"    - Parámetro ID: {hex(param_id)}, Longitud: {param_length}")
                     
-                    # Decodificar el valor según el tipo de dato, aquí un ejemplo para strings y dwords
                     if param_id in [0x0010, 0x0013]:
                         param_value = param_value_bytes.decode('gbk')
                         print(f"      Valor (STRING): {param_value}")
@@ -167,8 +159,6 @@ def handle_client(conn, addr):
 
                     current_byte += 5 + param_length
 
-                # No se requiere respuesta a este mensaje. El terminal está respondiendo a una solicitud.
-                
             elif message_id == 0x0002: # Terminal Heartbeat (Mensaje de latido)
                 print("  --> Tipo de Mensaje: HEARTBEAT (0x0002)")
                 response_message_id = 0x8001
@@ -184,7 +174,6 @@ def handle_client(conn, addr):
                 print(f"  --> Cuerpo del mensaje (hex): {message_body.hex()}")
                 print(f"  No se requiere respuesta automática para el mensaje {hex(message_id)}.")
             
-            # Construir y enviar la respuesta si se identificó una
             if response_message_id:
                 response_body_len = len(response_body)
                 response_attributes = (response_body_len & 0x03FF).to_bytes(2, 'big')
@@ -243,6 +232,10 @@ def start_server():
     finally:
         server_socket.close()
         print("Servidor TCP detenido.")
+
+# --- Punto de Entrada del Programa ---
+if __name__ == "__main__":
+    start_server()
 
 # --- Punto de Entrada del Programa ---
 if __name__ == "__main__":
