@@ -12,8 +12,6 @@ TIMEOUT_IN_SECONDS = 30 * 60 # 30 minutos
 def unescape_jt808(data_bytes_with_delimiters):
     """
     Des-escapa los bytes de un mensaje JT/T 808.
-    Elimina los bytes 0x7e inicial y final si están presentes.
-    Des-escapa las secuencias 0x7d 0x01 -> 0x7d y 0x7d 0x02 -> 0x7e.
     """
     if data_bytes_with_delimiters.startswith(b'\x7e') and \
        data_bytes_with_delimiters.endswith(b'\x7e'):
@@ -166,8 +164,79 @@ def handle_client(conn, addr):
 
             elif message_id == 0x0200: # Reporte de Información de Posición
                 print("  --> Tipo de Mensaje: REPORTE DE POSICIÓN (0x0200)")
+
+                if len(message_body) < 28:
+                    print("  [ERROR] Cuerpo del mensaje 0x0200 demasiado corto para la información básica.")
+                    response_result = 0x01
+                else:
+                    alarm_flag = int.from_bytes(message_body[0:4], 'big')
+                    status = int.from_bytes(message_body[4:8], 'big')
+                    latitude_raw = int.from_bytes(message_body[8:12], 'big')
+                    longitude_raw = int.from_bytes(message_body[12:16], 'big')
+                    elevation = int.from_bytes(message_body[16:18], 'big')
+                    speed_raw = int.from_bytes(message_body[18:20], 'big')
+                    direction = int.from_bytes(message_body[20:22], 'big')
+                    time_raw = message_body[22:28]
+
+                    latitude = latitude_raw / 1_000_000.0
+                    longitude = longitude_raw / 1_000_000.0
+                    speed = speed_raw / 10.0
+                    time_str = f"20{time_raw[0]:02x}-{time_raw[1]:02x}-{time_raw[2]:02x} {time_raw[3]:02x}:{time_raw[4]:02x}:{time_raw[5]:02x} GMT+8"
+
+                    position_status = "Posicionado" if (status >> 1) & 1 else "No posicionado"
+                    latitude_type = "Sur" if (status >> 2) & 1 else "Norte"
+                    longitude_type = "Oeste" if (status >> 3) & 1 else "Este"
+                    acc_status = "Encendido" if status & 1 else "Apagado"
+                    
+                    print("  --- Información de Posición Básica ---")
+                    print(f"  - Alarma: {hex(alarm_flag)}")
+                    print(f"  - Estado: {hex(status)} (ACC: {acc_status}, Posición: {position_status}, Lat: {latitude_type}, Lon: {longitude_type})")
+                    print(f"  - Latitud: {latitude:.6f}")
+                    print(f"  - Longitud: {longitude:.6f}")
+                    print(f"  - Elevación: {elevation} m")
+                    print(f"  - Velocidad: {speed} km/h")
+                    print(f"  - Dirección: {direction} grados")
+                    print(f"  - Hora: {time_str}")
+
+                    # --- ANÁLISIS DE LA INFORMACIÓN ADICIONAL ---
+                    additional_info_start = 28
+                    if len(message_body) > additional_info_start:
+                        print("  --- Información de Posición Adicional ---")
+                        current_byte = additional_info_start
+                        while current_byte < len(message_body):
+                            additional_id = message_body[current_byte]
+                            additional_length = message_body[current_byte+1]
+                            additional_value = message_body[current_byte+2:current_byte+2+additional_length]
+                            
+                            print(f"  - ID Adicional: {hex(additional_id)}, Longitud: {additional_length}")
+
+                            # Mapear IDs adicionales conocidos
+                            if additional_id == 0x01:
+                                mileage = int.from_bytes(additional_value, 'big')
+                                print(f"    - Kilometraje (km): {mileage / 10.0}")
+                            elif additional_id == 0x30:
+                                trip_minutes = int.from_bytes(additional_value, 'big')
+                                print(f"    - Recorrido (min): {trip_minutes}")
+                            elif additional_id == 0x31:
+                                gps_speed = int.from_bytes(additional_value, 'big')
+                                print(f"    - Velocidad GPS (km/h): {gps_speed / 10.0}")
+                            elif additional_id == 0xeb:
+                                # Analizar el campo especial de tu proveedor
+                                print(f"    - Campo del Proveedor (ID: 0xeb), valor hex: {additional_value.hex()}")
+                                try:
+                                    # Por ejemplo, si es una cadena, decodifícala.
+                                    decoded_value = additional_value.decode('ascii')
+                                    print(f"    - Valor decodificado (ASCII): {decoded_value}")
+                                except UnicodeDecodeError:
+                                    pass
+                            else:
+                                print(f"    - Valor (HEX): {additional_value.hex()}")
+
+                            current_byte += 2 + additional_length
+                
                 response_message_id = 0x8001
                 response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
+
 
             else:
                 print(f"  --> Tipo de Mensaje: ID DESCONOCIDO {hex(message_id)}")
@@ -196,7 +265,6 @@ def handle_client(conn, addr):
                 conn.sendall(final_response)
                 print(f"  [RESPUESTA ENVIADA a {addr}] Mensaje {hex(response_message_id)} con serial {message_serial_number} y resultado {response_result}.")
                 print(f"  Respuesta completa (Hex): {final_response.hex()}")
-
 
     except socket.timeout:
         print(f"[TIMEOUT] Cliente {addr} inactivo por {TIMEOUT_IN_SECONDS / 60} minutos. Cerrando conexión.")
@@ -232,10 +300,6 @@ def start_server():
     finally:
         server_socket.close()
         print("Servidor TCP detenido.")
-
-# --- Punto de Entrada del Programa ---
-if __name__ == "__main__":
-    start_server()
 
 # --- Punto de Entrada del Programa ---
 if __name__ == "__main__":
