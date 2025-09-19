@@ -159,6 +159,21 @@ def handle_client(conn, addr):
 
             elif message_id == 0x0002: # Terminal Heartbeat (Mensaje de latido)
                 print("  --> Tipo de Mensaje: HEARTBEAT (0x0002)")
+                
+                # En tu trama de ejemplo, el heartbeat no tenía campos adicionales.
+                # Si en el futuro los tuviera, la siguiente lógica los procesaría.
+                additional_info_start = 0
+                if len(message_body) > additional_info_start:
+                    print("  --- Información Adicional del Heartbeat ---")
+                    current_byte = additional_info_start
+                    while current_byte < len(message_body):
+                        additional_id = message_body[current_byte]
+                        additional_length = message_body[current_byte+1]
+                        additional_value = message_body[current_byte+2:current_byte+2+additional_length]
+                        print(f"  - ID Adicional: {hex(additional_id)}, Longitud: {additional_length}")
+                        print(f"    - Valor (HEX): {additional_value.hex()}")
+                        current_byte += 2 + additional_length
+
                 response_message_id = 0x8001
                 response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
 
@@ -210,7 +225,7 @@ def handle_client(conn, addr):
                             
                             print(f"  - ID Adicional: {hex(additional_id)}, Longitud: {additional_length}")
 
-                            # Mapear IDs adicionales conocidos
+                            # Mapear IDs adicionales comunes
                             if additional_id == 0x01:
                                 mileage = int.from_bytes(additional_value, 'big')
                                 print(f"    - Kilometraje (km): {mileage / 10.0}")
@@ -220,23 +235,30 @@ def handle_client(conn, addr):
                             elif additional_id == 0x31:
                                 gps_speed = int.from_bytes(additional_value, 'big')
                                 print(f"    - Velocidad GPS (km/h): {gps_speed / 10.0}")
+                            elif additional_id == 0x32:
+                                # Lógica para decodificar la batería
+                                battery_voltage_mv = int.from_bytes(additional_value, 'big')
+                                print(f"    - Voltaje de Batería (V): {battery_voltage_mv / 100.0}")
                             elif additional_id == 0xeb:
-                                # Analizar el campo especial de tu proveedor
-                                print(f"    - Campo del Proveedor (ID: 0xeb), valor hex: {additional_value.hex()}")
+                                # Lógica para decodificar las redes Wi-Fi
+                                print("    - Redes Wi-Fi Detectadas:")
                                 try:
-                                    # Por ejemplo, si es una cadena, decodifícala.
-                                    decoded_value = additional_value.decode('ascii')
-                                    print(f"    - Valor decodificado (ASCII): {decoded_value}")
+                                    wifi_data_string = additional_value.decode('ascii')
+                                    wifi_list = wifi_data_string.split(',')
+                                    for i in range(0, len(wifi_list), 2):
+                                        if i + 1 < len(wifi_list):
+                                            mac = wifi_list[i]
+                                            rssi = wifi_list[i+1]
+                                            print(f"      - MAC: {mac}, RSSI: {rssi}")
                                 except UnicodeDecodeError:
-                                    pass
+                                    print(f"    - Valor (HEX): {additional_value.hex()} (Error de decodificación)")
                             else:
                                 print(f"    - Valor (HEX): {additional_value.hex()}")
-
+                            
                             current_byte += 2 + additional_length
                 
                 response_message_id = 0x8001
                 response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
-
 
             else:
                 print(f"  --> Tipo de Mensaje: ID DESCONOCIDO {hex(message_id)}")
