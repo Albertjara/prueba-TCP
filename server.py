@@ -2,6 +2,7 @@ import socket
 import threading
 import os
 import time
+import struct
 
 # --- Configuración del Servidor ---
 HOST = '0.0.0.0'
@@ -244,27 +245,71 @@ def handle_client(conn, addr):
                                 battery_voltage = int.from_bytes(additional_value, 'big')
                                 print(f"    - Voltaje de Batería (V): {battery_voltage / 100.0}")
                             elif additional_id == 0xeb:
-                                # Nueva lógica de parsing para la sub-trama del campo 0xeb
-                                print("    - Redes Wi-Fi Detectadas:")
-                                try:
-                                    sub_byte_index = 0
-                                    # La sub-trama parece contener un campo de conteo antes de la lista
-                                    num_wifi_networks = additional_value[sub_byte_index]
-                                    sub_byte_index += 1
+                                # Lógica de parsing para la sub-trama del campo 0xeb
+                                print("    - Sub-trama de información extendida:")
+                                sub_current_byte = 0
+                                while sub_current_byte < len(additional_value):
+                                    # Los campos dentro de 0xeb tienen ID de 2 bytes y Longitud de 1 byte
+                                    if sub_current_byte + 3 > len(additional_value):
+                                        print(f"      [ADVERTENCIA] Datos insuficientes en sub-trama 0xeb. Deteniendo el parsing.")
+                                        break
+                                        
+                                    sub_id = int.from_bytes(additional_value[sub_current_byte:sub_current_byte+2], 'big')
+                                    sub_length = additional_value[sub_current_byte+2]
                                     
-                                    # El resto de la sub-trama es la cadena de texto con las redes
-                                    wifi_data_string = additional_value[sub_byte_index:].decode('ascii')
-                                    wifi_entries = wifi_data_string.split(',')
+                                    if sub_current_byte + 3 + sub_length > len(additional_value):
+                                        print(f"      [ADVERTENCIA] Datos insuficientes para el sub-campo {hex(sub_id)}. Deteniendo el parsing.")
+                                        break
+                                        
+                                    sub_value = additional_value[sub_current_byte+3:sub_current_byte+3+sub_length]
                                     
-                                    print(f"      - Número de redes declaradas: {num_wifi_networks}")
-                                    for i in range(0, len(wifi_entries), 2):
-                                        if i + 1 < len(wifi_entries):
-                                            mac = wifi_entries[i]
-                                            rssi = wifi_entries[i+1]
-                                            print(f"        - MAC: {mac}, RSSI: {rssi}")
-                                except (UnicodeDecodeError, IndexError) as e:
-                                    print(f"      - Error de decodificación o formato de la lista de Wi-Fi: {e}")
-                                    print(f"      - Valor (HEX): {additional_value.hex()}")
+                                    print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}")
+                                    
+                                    # Decodificación basada en el protocolo conocido
+                                    if sub_id == 0x0006 or sub_id == 0x00c5:
+                                        status_bits = int.from_bytes(sub_value, 'big')
+                                        positioning_status = ""
+                                        if (status_bits >> 3) & 1:
+                                            positioning_status = "Posicionamiento GPS"
+                                        elif (status_bits >> 4) & 1:
+                                            positioning_status = "Posicionamiento WiFi"
+                                        else:
+                                            positioning_status = "Sin posicionamiento"
+                                            
+                                        vibration_alarm = "Normal" if (status_bits >> 6) & 1 else "Alarma de vibración"
+                                        print(f"        - Bits de estado: {hex(status_bits)} ({positioning_status}, {vibration_alarm})")
+                                    elif sub_id == 0x002d:
+                                        voltage_mv = int.from_bytes(sub_value, 'big')
+                                        print(f"        - Voltaje (V): {voltage_mv / 1000.0}")
+                                    elif sub_id == 0x00a8:
+                                        percentage = int.from_bytes(sub_value, 'big')
+                                        print(f"        - Porcentaje de Batería (%): {percentage}")
+                                    elif sub_id == 0x00d5:
+                                        try:
+                                            imei = sub_value.decode('ascii')
+                                            print(f"        - IMEI: {imei}")
+                                        except UnicodeDecodeError:
+                                            print(f"        - IMEI (HEX): {sub_value.hex()} (Error de decodificación)")
+                                    elif sub_id == 0x00b9:
+                                        # Este es el campo que contenía la lista de Wi-Fi.
+                                        print("        - Lista de redes Wi-Fi:")
+                                        try:
+                                            # La lista de Wi-Fi es una cadena de texto
+                                            wifi_data_string = sub_value.decode('ascii')
+                                            wifi_entries = wifi_data_string.split(',')
+                                            for i in range(0, len(wifi_entries), 2):
+                                                if i + 1 < len(wifi_entries):
+                                                    mac = wifi_entries[i]
+                                                    rssi = wifi_entries[i+1]
+                                                    print(f"          - MAC: {mac}, RSSI: {rssi}")
+                                        except (UnicodeDecodeError, IndexError) as e:
+                                            print(f"        - Error de decodificación o formato de la lista de Wi-Fi: {e}")
+                                            print(f"        - Valor (HEX): {sub_value.hex()}")
+                                    else:
+                                        print(f"        - Valor (HEX): {sub_value.hex()}")
+                                    
+                                    sub_current_byte += 3 + sub_length
+                                    
                             else:
                                 print(f"    - Valor (HEX): {additional_value.hex()}")
                             
