@@ -257,6 +257,20 @@ def handle_client(conn, addr):
                                     sub_id = int.from_bytes(additional_value[sub_current_byte:sub_current_byte+2], 'big')
                                     sub_length = additional_value[sub_current_byte+2]
                                     
+                                    # Caso especial para el campo de lista Wi-Fi (0x00b9)
+                                    if sub_id == 0x00b9:
+                                        print("        - Lista de redes Wi-Fi:")
+                                        wifi_data_string = additional_value[sub_current_byte+3:].decode('ascii')
+                                        wifi_entries = wifi_data_string.split(',')
+                                        for i in range(0, len(wifi_entries), 2):
+                                            if i + 1 < len(wifi_entries):
+                                                mac = wifi_entries[i]
+                                                rssi = wifi_entries[i+1]
+                                                print(f"          - MAC: {mac}, RSSI: {rssi}")
+                                        sub_current_byte = len(additional_value) # Salir del bucle
+                                        continue
+
+                                    # Continúa con el parsing normal para otros campos
                                     if sub_current_byte + 3 + sub_length > len(additional_value):
                                         print(f"      [ADVERTENCIA] Datos insuficientes para el sub-campo {hex(sub_id)}. Deteniendo el parsing.")
                                         break
@@ -290,21 +304,6 @@ def handle_client(conn, addr):
                                             print(f"        - IMEI: {imei}")
                                         except UnicodeDecodeError:
                                             print(f"        - IMEI (HEX): {sub_value.hex()} (Error de decodificación)")
-                                    elif sub_id == 0x00b9:
-                                        # Este es el campo que contenía la lista de Wi-Fi.
-                                        print("        - Lista de redes Wi-Fi:")
-                                        try:
-                                            # La lista de Wi-Fi es una cadena de texto
-                                            wifi_data_string = sub_value.decode('ascii')
-                                            wifi_entries = wifi_data_string.split(',')
-                                            for i in range(0, len(wifi_entries), 2):
-                                                if i + 1 < len(wifi_entries):
-                                                    mac = wifi_entries[i]
-                                                    rssi = wifi_entries[i+1]
-                                                    print(f"          - MAC: {mac}, RSSI: {rssi}")
-                                        except (UnicodeDecodeError, IndexError) as e:
-                                            print(f"        - Error de decodificación o formato de la lista de Wi-Fi: {e}")
-                                            print(f"        - Valor (HEX): {sub_value.hex()}")
                                     else:
                                         print(f"        - Valor (HEX): {sub_value.hex()}")
                                     
