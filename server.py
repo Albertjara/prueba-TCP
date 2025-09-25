@@ -60,7 +60,7 @@ def handle_client(conn, addr):
             # --- Procesamiento del Mensaje JT/T 808 ---
             processed_data = unescape_jt808(data)
             
-            print(f"[DATOS RECIBIDOS de {addr}] (Hex Crudo: {data.hex()})")
+            print(f"\n[DATOS RECIBIDOS de {addr}] (Hex Crudo: {data.hex()})")
             print(f"[DATOS PROCESADOS de {addr}] (Hex Des-escapado: {processed_data.hex()})")
 
             if len(processed_data) < 13: 
@@ -103,7 +103,7 @@ def handle_client(conn, addr):
             terminal_phone_number_str = "".join([f"{b:02x}" for b in terminal_phone_number_raw])
             print(f"  --> Teléfono Terminal (BCD): {terminal_phone_number_str}")
             
-            message_serial_number = int.from_bytes(message_serial_number_raw, 'little') 
+            message_serial_number = int.from_bytes(message_serial_number_raw, 'big') # Corregido a 'big'
             print(f"  --> Número de Serie: {message_serial_number} (raw: {message_serial_number_raw.hex()})")
             
             print(f"  --> Longitud del Cuerpo Esperada: {body_length} bytes (Real: {len(message_body)} bytes)")
@@ -133,13 +133,17 @@ def handle_client(conn, addr):
 
             elif message_id == 0x0104: # Respuesta a consulta de parámetros (enviada por el terminal)
                 print("  --> Tipo de Mensaje: RESPUESTA A CONSULTA DE PARÁMETROS (0x0104)")
-                response_serial_number_for_query = int.from_bytes(message_body[0:2], 'big')
+                response_serial_number_for_query = int.from_bytes(message_body[0:2], 'big') # Corregido a 'big'
                 num_parameters = message_body[2]
                 print(f"  --> Responde a la consulta con serial {response_serial_number_for_query}")
                 print(f"  --> Total de parámetros recibidos: {num_parameters}")
                 
                 current_byte = 3
                 for _ in range(num_parameters):
+                    if current_byte + 5 > len(message_body):
+                        print("  [ADVERTENCIA] Datos insuficientes para el próximo parámetro. Deteniendo el parsing.")
+                        break
+
                     param_id = int.from_bytes(message_body[current_byte:current_byte+4], 'big')
                     param_length = message_body[current_byte+4]
                     param_value_bytes = message_body[current_byte+5:current_byte+5+param_length]
@@ -160,8 +164,6 @@ def handle_client(conn, addr):
             elif message_id == 0x0002: # Terminal Heartbeat (Mensaje de latido)
                 print("  --> Tipo de Mensaje: HEARTBEAT (0x0002)")
                 
-                # En tu trama de ejemplo, el heartbeat no tenía campos adicionales.
-                # Si en el futuro los tuviera, la siguiente lógica los procesaría.
                 additional_info_start = 0
                 if len(message_body) > additional_info_start:
                     print("  --- Información Adicional del Heartbeat ---")
@@ -179,7 +181,6 @@ def handle_client(conn, addr):
 
             elif message_id == 0x0200: # Reporte de Información de Posición
                 print("  --> Tipo de Mensaje: REPORTE DE POSICIÓN (0x0200)")
-
                 if len(message_body) < 28:
                     print("  [ERROR] Cuerpo del mensaje 0x0200 demasiado corto para la información básica.")
                     response_result = 0x01
@@ -193,15 +194,17 @@ def handle_client(conn, addr):
                     direction = int.from_bytes(message_body[20:22], 'big')
                     time_raw = message_body[22:28]
 
+                    # Conversiones de valores
                     latitude = latitude_raw / 1_000_000.0
                     longitude = longitude_raw / 1_000_000.0
                     speed = speed_raw / 10.0
                     time_str = f"20{time_raw[0]:02x}-{time_raw[1]:02x}-{time_raw[2]:02x} {time_raw[3]:02x}:{time_raw[4]:02x}:{time_raw[5]:02x} GMT+8"
 
+                    # Decodificación de bits del estado
+                    acc_status = "Encendido" if status & 1 else "Apagado"
                     position_status = "Posicionado" if (status >> 1) & 1 else "No posicionado"
                     latitude_type = "Sur" if (status >> 2) & 1 else "Norte"
                     longitude_type = "Oeste" if (status >> 3) & 1 else "Este"
-                    acc_status = "Encendido" if status & 1 else "Apagado"
                     
                     print("  --- Información de Posición Básica ---")
                     print(f"  - Alarma: {hex(alarm_flag)}")
@@ -219,36 +222,36 @@ def handle_client(conn, addr):
                         print("  --- Información de Posición Adicional ---")
                         current_byte = additional_info_start
                         while current_byte < len(message_body):
+                            if current_byte + 2 > len(message_body):
+                                print("  [ADVERTENCIA] Datos insuficientes para el próximo campo adicional. Deteniendo el parsing.")
+                                break
+
                             additional_id = message_body[current_byte]
                             additional_length = message_body[current_byte+1]
                             additional_value = message_body[current_byte+2:current_byte+2+additional_length]
                             
+                            if len(additional_value) < additional_length:
+                                print(f"  [ADVERTENCIA] Datos insuficientes para el campo {hex(additional_id)}. Longitud esperada: {additional_length}, real: {len(additional_value)}. Deteniendo el parsing.")
+                                break
+                            
                             print(f"  - ID Adicional: {hex(additional_id)}, Longitud: {additional_length}")
-
-                            # Mapear IDs adicionales comunes
+                            
                             if additional_id == 0x01:
                                 mileage = int.from_bytes(additional_value, 'big')
                                 print(f"    - Kilometraje (km): {mileage / 10.0}")
-                            elif additional_id == 0x30:
-                                trip_minutes = int.from_bytes(additional_value, 'big')
-                                print(f"    - Recorrido (min): {trip_minutes}")
-                            elif additional_id == 0x31:
-                                gps_speed = int.from_bytes(additional_value, 'big')
-                                print(f"    - Velocidad GPS (km/h): {gps_speed / 10.0}")
                             elif additional_id == 0x32:
-                                # Lógica para decodificar la batería
-                                battery_voltage_mv = int.from_bytes(additional_value, 'big')
-                                print(f"    - Voltaje de Batería (V): {battery_voltage_mv / 100.0}")
+                                battery_voltage = int.from_bytes(additional_value, 'big')
+                                print(f"    - Voltaje de Batería (V): {battery_voltage / 100.0}")
                             elif additional_id == 0xeb:
-                                # Lógica para decodificar las redes Wi-Fi
                                 print("    - Redes Wi-Fi Detectadas:")
                                 try:
                                     wifi_data_string = additional_value.decode('ascii')
-                                    wifi_list = wifi_data_string.split(',')
-                                    for i in range(0, len(wifi_list), 2):
-                                        if i + 1 < len(wifi_list):
-                                            mac = wifi_list[i]
-                                            rssi = wifi_list[i+1]
+                                    # El protocolo BSJ usa un formato de lista simple.
+                                    wifi_entries = wifi_data_string.split(',')
+                                    for i in range(0, len(wifi_entries), 2):
+                                        if i + 1 < len(wifi_entries):
+                                            mac = wifi_entries[i]
+                                            rssi = wifi_entries[i+1]
                                             print(f"      - MAC: {mac}, RSSI: {rssi}")
                                 except UnicodeDecodeError:
                                     print(f"    - Valor (HEX): {additional_value.hex()} (Error de decodificación)")
