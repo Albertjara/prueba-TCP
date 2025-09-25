@@ -256,8 +256,31 @@ def handle_client(conn, addr):
                                     sub_id = int.from_bytes(additional_value[sub_current_byte:sub_current_byte+2], 'big')
                                     sub_length = additional_value[sub_current_byte+2]
                                     
+                                    # Lógica mejorada para manejar datos irregulares
                                     if sub_current_byte + 3 + sub_length > len(additional_value):
-                                        print(f"      [ADVERTENCIA] Datos insuficientes para el sub-campo {hex(sub_id)}. Longitud esperada: {sub_length}, real: {len(additional_value) - (sub_current_byte + 3)}. Deteniendo el parsing.")
+                                        print(f"      [ADVERTENCIA] Datos insuficientes para el sub-campo {hex(sub_id)}. Longitud esperada: {sub_length}, real: {len(additional_value) - (sub_current_byte + 3)}. Asumiendo que el resto de la trama es la lista de Wi-Fi.")
+                                        
+                                        # Asume que el resto de la trama es la lista de Wi-Fi
+                                        remaining_data = additional_value[sub_current_byte:]
+                                        print("        - Lista de redes Wi-Fi (resto de la trama):")
+                                        try:
+                                            wifi_data_string = remaining_data.decode('ascii')
+                                            # Eliminar el posible encabezado "0070" si está presente
+                                            if wifi_data_string.startswith('p\x00\xb9\x05'):
+                                                wifi_data_string = wifi_data_string[4:]
+                                            elif wifi_data_string.startswith('\x00\xb9\x05'):
+                                                wifi_data_string = wifi_data_string[3:]
+
+                                            wifi_entries = wifi_data_string.split(',')
+                                            for i in range(0, len(wifi_entries), 2):
+                                                if i + 1 < len(wifi_entries):
+                                                    mac = wifi_entries[i]
+                                                    rssi = wifi_entries[i+1]
+                                                    print(f"          - MAC: {mac}, RSSI: {rssi}")
+                                        except (UnicodeDecodeError, IndexError) as e:
+                                            print(f"        - Error de decodificación o formato de la lista de Wi-Fi: {e}")
+                                            print(f"        - Valor (HEX): {remaining_data.hex()}")
+                                        sub_current_byte = len(additional_value) # Terminar el bucle
                                         break
                                         
                                     sub_value = additional_value[sub_current_byte+3:sub_current_byte+3+sub_length]
