@@ -245,89 +245,103 @@ def handle_client(conn, addr):
                                 battery_voltage = int.from_bytes(additional_value, 'big')
                                 print(f"    - Voltaje de Batería (V): {battery_voltage / 100.0}")
                             elif additional_id == 0xeb:
-                                # Lógica de parsing para la sub-trama del campo 0xeb
                                 print("    - Sub-trama de información extendida:")
-                                sub_current_byte = 0
-                                while sub_current_byte < len(additional_value):
-                                    if sub_current_byte + 3 > len(additional_value):
-                                        print(f"      [ADVERTENCIA] Datos insuficientes en sub-trama 0xeb. Deteniendo el parsing.")
-                                        break
-                                        
-                                    sub_id = int.from_bytes(additional_value[sub_current_byte:sub_current_byte+2], 'big')
-                                    sub_length = additional_value[sub_current_byte+2]
-                                    
-                                    # Lógica mejorada para manejar datos irregulares
-                                    if sub_current_byte + 3 + sub_length > len(additional_value):
-                                        print(f"      [ADVERTENCIA] Datos insuficientes para el sub-campo {hex(sub_id)}. Longitud esperada: {sub_length}, real: {len(additional_value) - (sub_current_byte + 3)}. Asumiendo que el resto de la trama es la lista de Wi-Fi.")
-                                        
-                                        # Asume que el resto de la trama es la lista de Wi-Fi
-                                        remaining_data = additional_value[sub_current_byte:]
-                                        print("        - Lista de redes Wi-Fi (resto de la trama):")
-                                        try:
-                                            wifi_data_string = remaining_data.decode('ascii')
-                                            # Eliminar el posible encabezado "0070" si está presente
-                                            if wifi_data_string.startswith('p\x00\xb9\x05'):
-                                                wifi_data_string = wifi_data_string[4:]
-                                            elif wifi_data_string.startswith('\x00\xb9\x05'):
-                                                wifi_data_string = wifi_data_string[3:]
+                                
+                                # Definir el delimitador como una cadena de bytes
+                                DELIMITER = b'\x00\x70\x00\xb9\x052A:'
 
-                                            wifi_entries = wifi_data_string.split(',')
-                                            for i in range(0, len(wifi_entries), 2):
-                                                if i + 1 < len(wifi_entries):
-                                                    mac = wifi_entries[i]
-                                                    rssi = wifi_entries[i+1]
-                                                    print(f"          - MAC: {mac}, RSSI: {rssi}")
-                                        except (UnicodeDecodeError, IndexError) as e:
-                                            print(f"        - Error de decodificación o formato de la lista de Wi-Fi: {e}")
-                                            print(f"        - Valor (HEX): {remaining_data.hex()}")
-                                        sub_current_byte = len(additional_value) # Terminar el bucle
-                                        break
-                                        
-                                    sub_value = additional_value[sub_current_byte+3:sub_current_byte+3+sub_length]
+                                # Buscar la posición del delimitador
+                                delimiter_index = additional_value.find(DELIMITER)
+
+                                if delimiter_index != -1:
+                                    # Dividir la trama en dos partes
+                                    part1 = additional_value[:delimiter_index]
+                                    part2 = additional_value[delimiter_index + len(DELIMITER):]
+
+                                    # Procesar la primera parte
+                                    print("      - Primera parte (campos fijos):")
+                                    sub_current_byte = 0
                                     
-                                    print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}")
+                                    # Campo de estado de 2 bytes (0x0006)
+                                    if sub_current_byte + 3 <= len(part1):
+                                        sub_id = int.from_bytes(part1[sub_current_byte:sub_current_byte+2], 'big')
+                                        sub_length = part1[sub_current_byte+2]
+                                        if sub_id == 0x0006 and sub_current_byte + 3 + sub_length <= len(part1):
+                                            sub_value = part1[sub_current_byte+3:sub_current_byte+3+sub_length]
+                                            status_bits = int.from_bytes(sub_value, 'big')
+                                            positioning_status = "Sin posicionamiento"
+                                            if (status_bits >> 3) & 1:
+                                                positioning_status = "Posicionamiento GPS"
+                                            elif (status_bits >> 4) & 1:
+                                                positioning_status = "Posicionamiento WiFi"
+                                            vibration_alarm = "Normal" if (status_bits >> 6) & 1 else "Alarma de vibración"
+                                            print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()}")
+                                            print(f"        - Decodificado: ({positioning_status}, {vibration_alarm})")
+                                            sub_current_byte += 3 + sub_length
                                     
-                                    # Decodificación basada en el protocolo conocido
-                                    if sub_id in [0x0006, 0x00C5]:
-                                        status_bits = int.from_bytes(sub_value, 'big')
-                                        positioning_status = "Sin posicionamiento"
-                                        if (status_bits >> 3) & 1:
-                                            positioning_status = "Posicionamiento GPS"
-                                        elif (status_bits >> 4) & 1:
-                                            positioning_status = "Posicionamiento WiFi"
-                                            
-                                        vibration_alarm = "Normal" if (status_bits >> 6) & 1 else "Alarma de vibración"
-                                        print(f"        - Bits de estado: {hex(status_bits)} ({positioning_status}, {vibration_alarm})")
-                                    elif sub_id == 0x002d:
-                                        voltage_mv = int.from_bytes(sub_value, 'big')
-                                        print(f"        - Voltaje (V): {voltage_mv / 1000.0}")
-                                    elif sub_id == 0x00a8:
-                                        percentage = int.from_bytes(sub_value, 'big')
-                                        print(f"        - Porcentaje de Batería (%): {percentage}")
-                                    elif sub_id == 0x00d5:
-                                        try:
-                                            imei = sub_value.decode('ascii')
-                                            print(f"        - IMEI: {imei}")
-                                        except UnicodeDecodeError:
-                                            print(f"        - IMEI (HEX): {sub_value.hex()} (Error de decodificación)")
-                                    elif sub_id == 0x00b9:
-                                        print("        - Lista de redes Wi-Fi:")
-                                        try:
-                                            wifi_data_string = sub_value.decode('ascii')
-                                            wifi_entries = wifi_data_string.split(',')
-                                            for i in range(0, len(wifi_entries), 2):
-                                                if i + 1 < len(wifi_entries):
-                                                    mac = wifi_entries[i]
-                                                    rssi = wifi_entries[i+1]
-                                                    print(f"          - MAC: {mac}, RSSI: {rssi}")
-                                        except (UnicodeDecodeError, IndexError) as e:
-                                            print(f"        - Error de decodificación o formato de la lista de Wi-Fi: {e}")
-                                            print(f"        - Valor (HEX): {sub_value.hex()}")
-                                    else:
-                                        print(f"        - Valor (HEX): {sub_value.hex()}")
+                                    # Campo de estado de 2 bytes (0x00C5)
+                                    if sub_current_byte + 3 <= len(part1):
+                                        sub_id = int.from_bytes(part1[sub_current_byte:sub_current_byte+2], 'big')
+                                        sub_length = part1[sub_current_byte+2]
+                                        if sub_id == 0x00c5 and sub_current_byte + 3 + sub_length <= len(part1):
+                                            sub_value = part1[sub_current_byte+3:sub_current_byte+3+sub_length]
+                                            status_bits = int.from_bytes(sub_value, 'big')
+                                            print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()}")
+                                            sub_current_byte += 3 + sub_length
+
+                                    # Campo de voltaje (0x002d)
+                                    if sub_current_byte + 3 <= len(part1):
+                                        sub_id = int.from_bytes(part1[sub_current_byte:sub_current_byte+2], 'big')
+                                        sub_length = part1[sub_current_byte+2]
+                                        if sub_id == 0x002d and sub_current_byte + 3 + sub_length <= len(part1):
+                                            sub_value = part1[sub_current_byte+3:sub_current_byte+3+sub_length]
+                                            voltage_mv = int.from_bytes(sub_value, 'big')
+                                            print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()}")
+                                            print(f"        - Voltaje (V): {voltage_mv / 1000.0}")
+                                            sub_current_byte += 3 + sub_length
+
+                                    # Campo de porcentaje de batería (0x00a8)
+                                    if sub_current_byte + 3 <= len(part1):
+                                        sub_id = int.from_bytes(part1[sub_current_byte:sub_current_byte+2], 'big')
+                                        sub_length = part1[sub_current_byte+2]
+                                        if sub_id == 0x00a8 and sub_current_byte + 3 + sub_length <= len(part1):
+                                            sub_value = part1[sub_current_byte+3:sub_current_byte+3+sub_length]
+                                            percentage = int.from_bytes(sub_value, 'big')
+                                            print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()}")
+                                            print(f"        - Porcentaje de Batería (%): {percentage}")
+                                            sub_current_byte += 3 + sub_length
                                     
-                                    sub_current_byte += 3 + sub_length
-                                    
+                                    # Campo de IMEI (0x00d5)
+                                    if sub_current_byte + 3 <= len(part1):
+                                        sub_id = int.from_bytes(part1[sub_current_byte:sub_current_byte+2], 'big')
+                                        sub_length = part1[sub_current_byte+2]
+                                        if sub_id == 0x00d5 and sub_current_byte + 3 + sub_length <= len(part1):
+                                            sub_value = part1[sub_current_byte+3:sub_current_byte+3+sub_length]
+                                            try:
+                                                imei = sub_value.decode('ascii')
+                                                print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()}")
+                                                print(f"        - IMEI: {imei}")
+                                            except UnicodeDecodeError:
+                                                print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()} (Error de decodificación)")
+                                            sub_current_byte += 3 + sub_length
+
+                                    # Procesar la segunda parte (Wi-Fi)
+                                    print("      - Segunda parte (lista de Wi-Fi):")
+                                    try:
+                                        wifi_data_string = part2.decode('ascii')
+                                        wifi_entries = wifi_data_string.split(',')
+                                        for i in range(0, len(wifi_entries), 2):
+                                            if i + 1 < len(wifi_entries):
+                                                mac = wifi_entries[i]
+                                                rssi = wifi_entries[i+1]
+                                                print(f"        - MAC: {mac}, RSSI: {rssi}")
+                                    except (UnicodeDecodeError, IndexError) as e:
+                                        print(f"      - Error de decodificación o formato de la lista de Wi-Fi: {e}")
+                                        print(f"      - Valor (HEX): {part2.hex()}")
+                                else:
+                                    print("      [ADVERTENCIA] No se encontró el delimitador de Wi-Fi, no se puede dividir la trama.")
+                                    print(f"      - Valor completo de la sub-trama eb (HEX): {additional_value.hex()}")
+
                             else:
                                 print(f"    - Valor (HEX): {additional_value.hex()}")
                             
