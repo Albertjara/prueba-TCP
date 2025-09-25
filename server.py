@@ -103,7 +103,7 @@ def handle_client(conn, addr):
             terminal_phone_number_str = "".join([f"{b:02x}" for b in terminal_phone_number_raw])
             print(f"  --> Teléfono Terminal (BCD): {terminal_phone_number_str}")
             
-            message_serial_number = int.from_bytes(message_serial_number_raw, 'big') # Corregido a 'big'
+            message_serial_number = int.from_bytes(message_serial_number_raw, 'big')
             print(f"  --> Número de Serie: {message_serial_number} (raw: {message_serial_number_raw.hex()})")
             
             print(f"  --> Longitud del Cuerpo Esperada: {body_length} bytes (Real: {len(message_body)} bytes)")
@@ -133,7 +133,7 @@ def handle_client(conn, addr):
 
             elif message_id == 0x0104: # Respuesta a consulta de parámetros (enviada por el terminal)
                 print("  --> Tipo de Mensaje: RESPUESTA A CONSULTA DE PARÁMETROS (0x0104)")
-                response_serial_number_for_query = int.from_bytes(message_body[0:2], 'big') # Corregido a 'big'
+                response_serial_number_for_query = int.from_bytes(message_body[0:2], 'big')
                 num_parameters = message_body[2]
                 print(f"  --> Responde a la consulta con serial {response_serial_number_for_query}")
                 print(f"  --> Total de parámetros recibidos: {num_parameters}")
@@ -228,11 +228,12 @@ def handle_client(conn, addr):
 
                             additional_id = message_body[current_byte]
                             additional_length = message_body[current_byte+1]
-                            additional_value = message_body[current_byte+2:current_byte+2+additional_length]
                             
-                            if len(additional_value) < additional_length:
-                                print(f"  [ADVERTENCIA] Datos insuficientes para el campo {hex(additional_id)}. Longitud esperada: {additional_length}, real: {len(additional_value)}. Deteniendo el parsing.")
+                            if current_byte + 2 + additional_length > len(message_body):
+                                print(f"  [ADVERTENCIA] Datos insuficientes para el campo {hex(additional_id)}. Longitud esperada: {additional_length}, real: {len(message_body) - (current_byte + 2)}. Deteniendo el parsing.")
                                 break
+                            
+                            additional_value = message_body[current_byte+2:current_byte+2+additional_length]
                             
                             print(f"  - ID Adicional: {hex(additional_id)}, Longitud: {additional_length}")
                             
@@ -243,18 +244,27 @@ def handle_client(conn, addr):
                                 battery_voltage = int.from_bytes(additional_value, 'big')
                                 print(f"    - Voltaje de Batería (V): {battery_voltage / 100.0}")
                             elif additional_id == 0xeb:
+                                # Nueva lógica de parsing para la sub-trama del campo 0xeb
                                 print("    - Redes Wi-Fi Detectadas:")
                                 try:
-                                    wifi_data_string = additional_value.decode('ascii')
-                                    # El protocolo BSJ usa un formato de lista simple.
+                                    sub_byte_index = 0
+                                    # La sub-trama parece contener un campo de conteo antes de la lista
+                                    num_wifi_networks = additional_value[sub_byte_index]
+                                    sub_byte_index += 1
+                                    
+                                    # El resto de la sub-trama es la cadena de texto con las redes
+                                    wifi_data_string = additional_value[sub_byte_index:].decode('ascii')
                                     wifi_entries = wifi_data_string.split(',')
+                                    
+                                    print(f"      - Número de redes declaradas: {num_wifi_networks}")
                                     for i in range(0, len(wifi_entries), 2):
                                         if i + 1 < len(wifi_entries):
                                             mac = wifi_entries[i]
                                             rssi = wifi_entries[i+1]
-                                            print(f"      - MAC: {mac}, RSSI: {rssi}")
-                                except UnicodeDecodeError:
-                                    print(f"    - Valor (HEX): {additional_value.hex()} (Error de decodificación)")
+                                            print(f"        - MAC: {mac}, RSSI: {rssi}")
+                                except (UnicodeDecodeError, IndexError) as e:
+                                    print(f"      - Error de decodificación o formato de la lista de Wi-Fi: {e}")
+                                    print(f"      - Valor (HEX): {additional_value.hex()}")
                             else:
                                 print(f"    - Valor (HEX): {additional_value.hex()}")
                             
