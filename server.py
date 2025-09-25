@@ -249,7 +249,6 @@ def handle_client(conn, addr):
                                 print("    - Sub-trama de información extendida:")
                                 sub_current_byte = 0
                                 while sub_current_byte < len(additional_value):
-                                    # Los campos dentro de 0xeb tienen ID de 2 bytes y Longitud de 1 byte
                                     if sub_current_byte + 3 > len(additional_value):
                                         print(f"      [ADVERTENCIA] Datos insuficientes en sub-trama 0xeb. Deteniendo el parsing.")
                                         break
@@ -257,22 +256,8 @@ def handle_client(conn, addr):
                                     sub_id = int.from_bytes(additional_value[sub_current_byte:sub_current_byte+2], 'big')
                                     sub_length = additional_value[sub_current_byte+2]
                                     
-                                    # Caso especial para el campo de lista Wi-Fi (0x00b9)
-                                    if sub_id == 0x00b9:
-                                        print("        - Lista de redes Wi-Fi:")
-                                        wifi_data_string = additional_value[sub_current_byte+3:].decode('ascii')
-                                        wifi_entries = wifi_data_string.split(',')
-                                        for i in range(0, len(wifi_entries), 2):
-                                            if i + 1 < len(wifi_entries):
-                                                mac = wifi_entries[i]
-                                                rssi = wifi_entries[i+1]
-                                                print(f"          - MAC: {mac}, RSSI: {rssi}")
-                                        sub_current_byte = len(additional_value) # Salir del bucle
-                                        continue
-
-                                    # Continúa con el parsing normal para otros campos
                                     if sub_current_byte + 3 + sub_length > len(additional_value):
-                                        print(f"      [ADVERTENCIA] Datos insuficientes para el sub-campo {hex(sub_id)}. Deteniendo el parsing.")
+                                        print(f"      [ADVERTENCIA] Datos insuficientes para el sub-campo {hex(sub_id)}. Longitud esperada: {sub_length}, real: {len(additional_value) - (sub_current_byte + 3)}. Deteniendo el parsing.")
                                         break
                                         
                                     sub_value = additional_value[sub_current_byte+3:sub_current_byte+3+sub_length]
@@ -280,15 +265,13 @@ def handle_client(conn, addr):
                                     print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}")
                                     
                                     # Decodificación basada en el protocolo conocido
-                                    if sub_id == 0x0006 or sub_id == 0x00c5:
+                                    if sub_id in [0x0006, 0x00C5]:
                                         status_bits = int.from_bytes(sub_value, 'big')
-                                        positioning_status = ""
+                                        positioning_status = "Sin posicionamiento"
                                         if (status_bits >> 3) & 1:
                                             positioning_status = "Posicionamiento GPS"
                                         elif (status_bits >> 4) & 1:
                                             positioning_status = "Posicionamiento WiFi"
-                                        else:
-                                            positioning_status = "Sin posicionamiento"
                                             
                                         vibration_alarm = "Normal" if (status_bits >> 6) & 1 else "Alarma de vibración"
                                         print(f"        - Bits de estado: {hex(status_bits)} ({positioning_status}, {vibration_alarm})")
@@ -304,6 +287,19 @@ def handle_client(conn, addr):
                                             print(f"        - IMEI: {imei}")
                                         except UnicodeDecodeError:
                                             print(f"        - IMEI (HEX): {sub_value.hex()} (Error de decodificación)")
+                                    elif sub_id == 0x00b9:
+                                        print("        - Lista de redes Wi-Fi:")
+                                        try:
+                                            wifi_data_string = sub_value.decode('ascii')
+                                            wifi_entries = wifi_data_string.split(',')
+                                            for i in range(0, len(wifi_entries), 2):
+                                                if i + 1 < len(wifi_entries):
+                                                    mac = wifi_entries[i]
+                                                    rssi = wifi_entries[i+1]
+                                                    print(f"          - MAC: {mac}, RSSI: {rssi}")
+                                        except (UnicodeDecodeError, IndexError) as e:
+                                            print(f"        - Error de decodificación o formato de la lista de Wi-Fi: {e}")
+                                            print(f"        - Valor (HEX): {sub_value.hex()}")
                                     else:
                                         print(f"        - Valor (HEX): {sub_value.hex()}")
                                     
