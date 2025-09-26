@@ -42,6 +42,97 @@ def unescape_jt808(data_bytes_with_delimiters):
             i += 1
     return bytes(unescaped_bytes)
 
+# --- Función para parsear sub-campos de la trama extendida 0xEB ---
+def parse_extended_eb_fields(additional_value):
+    """
+    Analiza la sub-trama extendida (ID 0xeb) basándose en la documentación proporcionada.
+    """
+    results = {}
+    sub_current_byte = 0
+    sub_data = additional_value
+    
+    while sub_current_byte < len(sub_data):
+        # Todos los sub-campos en 0xEB parecen usar ID de 2 bytes y Longitud de 1 byte
+        if sub_current_byte + 3 > len(sub_data):
+            # Quedan menos de 3 bytes para un nuevo ID y Longitud
+            break
+
+        sub_id = int.from_bytes(sub_data[sub_current_byte:sub_current_byte+2], 'big')
+        sub_length = sub_data[sub_current_byte+2]
+        
+        # Verificar que el sub_value no se extienda más allá de los datos
+        if sub_current_byte + 3 + sub_length > len(sub_data):
+            print(f"      [ERROR DE PARSING] Campo {hex(sub_id)} tiene longitud {sub_length} inválida.")
+            break
+            
+        sub_value_bytes = sub_data[sub_current_byte+3:sub_current_byte+3+sub_length]
+        
+        print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value_bytes.hex()}")
+
+        if sub_id == 0x0006 or sub_id == 0x00C5:
+            # 0x0006 y 0x00C5 (Bits de estado de alarma extendidos)
+            if sub_length >= 4:
+                status_bits = int.from_bytes(sub_value_bytes[0:4], 'big')
+                pos_status = "Sin posicionamiento"
+                if (status_bits >> 3) & 1:
+                    pos_status = "Posicionamiento GPS"
+                elif (status_bits >> 4) & 1:
+                    pos_status = "Posicionamiento WiFi"
+                vibration_alarm = "Normal" if (status_bits >> 6) & 1 else "Alarma de vibración"
+                
+                print(f"        - Estado: {hex(status_bits)}, Posicionamiento: {pos_status}, Vibración: {vibration_alarm}")
+                results[hex(sub_id)] = (status_bits, pos_status, vibration_alarm)
+
+        elif sub_id == 0x002D:
+            # 0x002D (Valor de voltaje) - 2 bytes, valor en mV / 1000
+            if sub_length == 2:
+                voltage_mv = int.from_bytes(sub_value_bytes, 'big')
+                voltage_v = voltage_mv / 1000.0
+                print(f"        - Voltaje: {voltage_v:.3f} V")
+                results['voltage'] = voltage_v
+
+        elif sub_id == 0x00A8:
+            # 0x00A8 (Porcentaje de batería) - 1 byte, valor directo en %
+            if sub_length == 1:
+                percentage = sub_value_bytes[0]
+                print(f"        - Porcentaje de Batería: {percentage} %")
+                results['battery_percent'] = percentage
+
+        elif sub_id == 0x00D5:
+            # 0x00D5 (Número IMEI del dispositivo) - 15 bytes, ASCII
+            if sub_length == 15:
+                try:
+                    imei = sub_value_bytes.decode('ascii')
+                    print(f"        - IMEI: {imei}")
+                    results['imei'] = imei
+                except UnicodeDecodeError:
+                    print(f"        - IMEI (Error de decodificación): {sub_value_bytes.hex()}")
+                    results['imei'] = sub_value_bytes.hex()
+        
+        elif sub_id == 0x00B9:
+            # 0x00B9 (Lista de redes Wi-Fi)
+            print(f"      - Lista de redes Wi-Fi (Raw data): {sub_value_bytes.hex()}")
+            try:
+                # El valor es una cadena ASCII con pares MAC, RSSI separados por coma
+                wifi_data_string = sub_value_bytes.decode('ascii')
+                wifi_entries = wifi_data_string.split(',')
+                wifi_list = []
+                for i in range(0, len(wifi_entries), 2):
+                    if i + 1 < len(wifi_entries):
+                        mac = wifi_entries[i]
+                        rssi = wifi_entries[i+1]
+                        print(f"        - MAC: {mac}, RSSI: {rssi}")
+                        wifi_list.append({'mac': mac, 'rssi': rssi})
+                results['wifi_list'] = wifi_list
+            except (UnicodeDecodeError, IndexError) as e:
+                print(f"        - Error de decodificación o formato de la lista de Wi-Fi: {e}")
+                results['wifi_list'] = sub_value_bytes.hex()
+        
+        # Avanzar al siguiente sub-campo
+        sub_current_byte += 3 + sub_length
+        
+    return results
+
 # --- Función para Manejar Cada Cliente Conectado ---
 def handle_client(conn, addr):
     """
@@ -132,54 +223,6 @@ def handle_client(conn, addr):
                 response_message_id = 0x8001
                 response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
 
-            elif message_id == 0x0104: # Respuesta a consulta de parámetros (enviada por el terminal)
-                print("  --> Tipo de Mensaje: RESPUESTA A CONSULTA DE PARÁMETROS (0x0104)")
-                response_serial_number_for_query = int.from_bytes(message_body[0:2], 'big')
-                num_parameters = message_body[2]
-                print(f"  --> Responde a la consulta con serial {response_serial_number_for_query}")
-                print(f"  --> Total de parámetros recibidos: {num_parameters}")
-                
-                current_byte = 3
-                for _ in range(num_parameters):
-                    if current_byte + 5 > len(message_body):
-                        print("  [ADVERTENCIA] Datos insuficientes para el próximo parámetro. Deteniendo el parsing.")
-                        break
-
-                    param_id = int.from_bytes(message_body[current_byte:current_byte+4], 'big')
-                    param_length = message_body[current_byte+4]
-                    param_value_bytes = message_body[current_byte+5:current_byte+5+param_length]
-                    
-                    print(f"    - Parámetro ID: {hex(param_id)}, Longitud: {param_length}")
-                    
-                    if param_id in [0x0010, 0x0013]:
-                        param_value = param_value_bytes.decode('gbk')
-                        print(f"      Valor (STRING): {param_value}")
-                    elif param_id in [0x0001, 0x0018, 0x0027, 0x0029, 0x0055, 0x0056, 0x0080]:
-                        param_value = int.from_bytes(param_value_bytes, 'big')
-                        print(f"      Valor (DWORD): {param_value}")
-                    else:
-                        print(f"      Valor (HEX): {param_value_bytes.hex()}")
-
-                    current_byte += 5 + param_length
-
-            elif message_id == 0x0002: # Terminal Heartbeat (Mensaje de latido)
-                print("  --> Tipo de Mensaje: HEARTBEAT (0x0002)")
-                
-                additional_info_start = 0
-                if len(message_body) > additional_info_start:
-                    print("  --- Información Adicional del Heartbeat ---")
-                    current_byte = additional_info_start
-                    while current_byte < len(message_body):
-                        additional_id = message_body[current_byte]
-                        additional_length = message_body[current_byte+1]
-                        additional_value = message_body[current_byte+2:current_byte+2+additional_length]
-                        print(f"  - ID Adicional: {hex(additional_id)}, Longitud: {additional_length}")
-                        print(f"    - Valor (HEX): {additional_value.hex()}")
-                        current_byte += 2 + additional_length
-
-                response_message_id = 0x8001
-                response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
-
             elif message_id == 0x0200: # Reporte de Información de Posición
                 print("  --> Tipo de Mensaje: REPORTE DE POSICIÓN (0x0200)")
                 if len(message_body) < 28:
@@ -245,103 +288,10 @@ def handle_client(conn, addr):
                                 battery_voltage = int.from_bytes(additional_value, 'big')
                                 print(f"    - Voltaje de Batería (V): {battery_voltage / 100.0}")
                             elif additional_id == 0xeb:
-                                print("    - Sub-trama de información extendida:")
-                                
-                                # Definir el delimitador como una cadena de bytes
-                                DELIMITER = b'\x00\x70\x00\xb9\x052A:'
-
-                                # Buscar la posición del delimitador
-                                delimiter_index = additional_value.find(DELIMITER)
-
-                                if delimiter_index != -1:
-                                    # Dividir la trama en dos partes
-                                    part1 = additional_value[:delimiter_index]
-                                    part2 = additional_value[delimiter_index + len(DELIMITER):]
-
-                                    # Procesar la primera parte
-                                    print("      - Primera parte (campos fijos):")
-                                    sub_current_byte = 0
-                                    
-                                    # Campo de estado de 2 bytes (0x0006)
-                                    if sub_current_byte + 3 <= len(part1):
-                                        sub_id = int.from_bytes(part1[sub_current_byte:sub_current_byte+2], 'big')
-                                        sub_length = part1[sub_current_byte+2]
-                                        if sub_id == 0x0006 and sub_current_byte + 3 + sub_length <= len(part1):
-                                            sub_value = part1[sub_current_byte+3:sub_current_byte+3+sub_length]
-                                            status_bits = int.from_bytes(sub_value, 'big')
-                                            positioning_status = "Sin posicionamiento"
-                                            if (status_bits >> 3) & 1:
-                                                positioning_status = "Posicionamiento GPS"
-                                            elif (status_bits >> 4) & 1:
-                                                positioning_status = "Posicionamiento WiFi"
-                                            vibration_alarm = "Normal" if (status_bits >> 6) & 1 else "Alarma de vibración"
-                                            print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()}")
-                                            print(f"        - Decodificado: ({positioning_status}, {vibration_alarm})")
-                                            sub_current_byte += 3 + sub_length
-                                    
-                                    # Campo de estado de 2 bytes (0x00C5)
-                                    if sub_current_byte + 3 <= len(part1):
-                                        sub_id = int.from_bytes(part1[sub_current_byte:sub_current_byte+2], 'big')
-                                        sub_length = part1[sub_current_byte+2]
-                                        if sub_id == 0x00c5 and sub_current_byte + 3 + sub_length <= len(part1):
-                                            sub_value = part1[sub_current_byte+3:sub_current_byte+3+sub_length]
-                                            status_bits = int.from_bytes(sub_value, 'big')
-                                            print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()}")
-                                            sub_current_byte += 3 + sub_length
-
-                                    # Campo de voltaje (0x002d)
-                                    if sub_current_byte + 3 <= len(part1):
-                                        sub_id = int.from_bytes(part1[sub_current_byte:sub_current_byte+2], 'big')
-                                        sub_length = part1[sub_current_byte+2]
-                                        if sub_id == 0x002d and sub_current_byte + 3 + sub_length <= len(part1):
-                                            sub_value = part1[sub_current_byte+3:sub_current_byte+3+sub_length]
-                                            voltage_mv = int.from_bytes(sub_value, 'big')
-                                            print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()}")
-                                            print(f"        - Voltaje (V): {voltage_mv / 1000.0}")
-                                            sub_current_byte += 3 + sub_length
-
-                                    # Campo de porcentaje de batería (0x00a8)
-                                    if sub_current_byte + 3 <= len(part1):
-                                        sub_id = int.from_bytes(part1[sub_current_byte:sub_current_byte+2], 'big')
-                                        sub_length = part1[sub_current_byte+2]
-                                        if sub_id == 0x00a8 and sub_current_byte + 3 + sub_length <= len(part1):
-                                            sub_value = part1[sub_current_byte+3:sub_current_byte+3+sub_length]
-                                            percentage = int.from_bytes(sub_value, 'big')
-                                            print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()}")
-                                            print(f"        - Porcentaje de Batería (%): {percentage}")
-                                            sub_current_byte += 3 + sub_length
-                                    
-                                    # Campo de IMEI (0x00d5)
-                                    if sub_current_byte + 3 <= len(part1):
-                                        sub_id = int.from_bytes(part1[sub_current_byte:sub_current_byte+2], 'big')
-                                        sub_length = part1[sub_current_byte+2]
-                                        if sub_id == 0x00d5 and sub_current_byte + 3 + sub_length <= len(part1):
-                                            sub_value = part1[sub_current_byte+3:sub_current_byte+3+sub_length]
-                                            try:
-                                                imei = sub_value.decode('ascii')
-                                                print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()}")
-                                                print(f"        - IMEI: {imei}")
-                                            except UnicodeDecodeError:
-                                                print(f"      - ID Sub-campo: {hex(sub_id)}, Longitud: {sub_length}, Valor (HEX): {sub_value.hex()} (Error de decodificación)")
-                                            sub_current_byte += 3 + sub_length
-
-                                    # Procesar la segunda parte (Wi-Fi)
-                                    print("      - Segunda parte (lista de Wi-Fi):")
-                                    try:
-                                        wifi_data_string = part2.decode('ascii')
-                                        wifi_entries = wifi_data_string.split(',')
-                                        for i in range(0, len(wifi_entries), 2):
-                                            if i + 1 < len(wifi_entries):
-                                                mac = wifi_entries[i]
-                                                rssi = wifi_entries[i+1]
-                                                print(f"        - MAC: {mac}, RSSI: {rssi}")
-                                    except (UnicodeDecodeError, IndexError) as e:
-                                        print(f"      - Error de decodificación o formato de la lista de Wi-Fi: {e}")
-                                        print(f"      - Valor (HEX): {part2.hex()}")
-                                else:
-                                    print("      [ADVERTENCIA] No se encontró el delimitador de Wi-Fi, no se puede dividir la trama.")
-                                    print(f"      - Valor completo de la sub-trama eb (HEX): {additional_value.hex()}")
-
+                                # Usar la función de parseo basada en el protocolo para 0xEB
+                                print("    - Sub-trama de información extendida (0xEB):")
+                                parse_extended_eb_fields(additional_value)
+                            
                             else:
                                 print(f"    - Valor (HEX): {additional_value.hex()}")
                             
@@ -416,3 +366,4 @@ def start_server():
 # --- Punto de Entrada del Programa ---
 if __name__ == "__main__":
     start_server()
+
