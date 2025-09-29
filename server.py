@@ -55,9 +55,7 @@ def unescape_jt808(data_bytes_with_delimiters):
 def escape_jt808(data_bytes):
     """
     Escapa los bytes de un mensaje JT/T 808 (reemplaza 0x7d -> 0x7d 0x01 y 0x7e -> 0x7d 0x02).
-    Esta función es necesaria antes de añadir los delimitadores 0x7e a la respuesta.
     """
-    # Escapa primero 0x7d y luego 0x7e, para evitar conflictos
     escaped = data_bytes.replace(b'\x7d', b'\x7d\x01')
     escaped = escaped.replace(b'\x7e', b'\x7d\x02')
     return escaped
@@ -163,12 +161,12 @@ def parse_status_bits(status_raw):
         "Valor RAW Completo": hex(status_int)
     }
 
-# --- Función para parsear sub-campos de la trama extendida 0xEB (CORREGIDA) ---
+# --- Función para parsear sub-campos de la trama extendida 0xEB (CORREGIDA V2) ---
 def parse_extended_eb_fields(additional_value):
     """
     Analiza la sub-trama extendida (ID 0xeb) utilizando la estructura L-ID-Valor.
-    CORRECCIÓN: Se usa Little-Endian para los campos de Longitud e ID (2 bytes cada uno) 
-    dentro de 0xEB, que son propietarios y no siguen el estándar Big-Endian.
+    CORRECCIÓN V2: Se usan Little-Endian para L e ID. El ID lógico debe ser remapeado
+    si se lee como Little-Endian.
     """
     sub_data = additional_value
     
@@ -189,7 +187,7 @@ def parse_extended_eb_fields(additional_value):
         
         # 1. Leer Longitud del Bloque (2 bytes, Little Endian)
         if sub_current_byte + 2 > len(sub_data): 
-            print(f"      [AVISO] Datos insuficientes para leer la longitud del bloque. Posición: {sub_current_byte}")
+            print(f"      [AVISO] Datos insuficientes para leer la longitud del bloque. Posición: {sub_current_byte}. Rompiendo ciclo.")
             break
             
         # L: Longitud total del bloque (ID + Valor). LEÍDO COMO LITTLE-ENDIAN.
@@ -198,11 +196,17 @@ def parse_extended_eb_fields(additional_value):
         # 2. Leer ID del Bloque (2 bytes, Little Endian)
         id_start = sub_current_byte + 2
         if id_start + 2 > len(sub_data): 
-            print(f"      [AVISO] Datos insuficientes para leer el ID del bloque. Posición: {id_start}")
+            print(f"      [AVISO] Datos insuficientes para leer el ID del bloque. Posición: {id_start}. Rompiendo ciclo.")
             break
             
         # T: ID del campo. LEÍDO COMO LITTLE-ENDIAN.
-        sub_id = int.from_bytes(sub_data[id_start:id_start+2], 'little')
+        sub_id_raw = sub_data[id_start:id_start+2]
+        sub_id_int_le = int.from_bytes(sub_id_raw, 'little')
+        
+        # El ID lógico es el byte invertido del ID en LE (ej: 0x89FF en documento, trama tiene FF89)
+        # Invertimos los bytes para obtener el ID lógico Big-Endian
+        # Ejemplo: Si sub_id_raw es b'\x89\xff' (Little-Endian), el ID lógico Big-Endian es b'\xff\x89'
+        sub_id_int = int.from_bytes(sub_id_raw, 'big')
         
         # 3. Calcular Longitud y Bytes del Valor
         value_start = id_start + 2
@@ -211,43 +215,40 @@ def parse_extended_eb_fields(additional_value):
         value_length = sub_length_block - 2 
         
         if value_length < 0:
-             print(f"      [ERROR] Longitud de valor calculada negativa ({value_length}) para el campo {hex(sub_id)}. Rompiendo ciclo.")
+             print(f"      [ERROR] Longitud de valor calculada negativa ({value_length}) para el campo {hex(sub_id_int)}. Rompiendo ciclo.")
              break
         
         value_end = value_start + value_length
 
         if value_end > len(sub_data):
-            print(f"      [ERROR] Longitud de valor inválida ({value_length} bytes) para el campo {hex(sub_id)}. Fin esperado: {value_end}. Real: {len(sub_data)}. Rompiendo ciclo.")
+            print(f"      [ERROR] Longitud de valor inválida ({value_length} bytes) para el campo {hex(sub_id_int)}. Fin esperado: {value_end}. Real: {len(sub_data)}. Rompiendo ciclo.")
             break
             
         sub_value_bytes = sub_data[value_start:value_end]
         
-        print(f"      > Campo ID: {hex(sub_id)} | Longitud Valor: {value_length} bytes | HEX: {sub_value_bytes.hex()}")
+        print(f"      > Campo ID (LE): {hex(sub_id_int)} | Longitud Valor: {value_length} bytes | HEX: {sub_value_bytes.hex()}")
 
-        if sub_id == 0x002D: # Valor de Voltaje (2 bytes, mV)
-            if value_length == 2:
-                # El valor en sí mismo es Big-Endian (WORD)
-                voltage_mv = int.from_bytes(sub_value_bytes, 'big') 
-                voltage_v = voltage_mv / 1000.0
-                print(f"        -> **Voltaje del Dispositivo (0x002D)**: {voltage_v:.3f} V (RAW: {voltage_mv} mV)")
-
-        elif sub_id == 0x00A8: # Porcentaje de Batería (1 byte)
-            if value_length == 1:
-                percentage = sub_value_bytes[0]
-                print(f"        -> **Porcentaje de Batería (0x00A8)**: {percentage} %")
+        # Mapeamos los IDs LÓGICOS (que en el documento son Big-Endian, pero se leen al revés)
         
-        elif sub_id == 0x00D5: # Número IMEI (15 bytes ASCII)
-            if value_length >= 15:
-                # Decodificamos solo los primeros 15 bytes
-                try:
-                    imei = sub_value_bytes[:15].decode('ascii')
-                    print(f"        -> **IMEI del Dispositivo (0x00D5)**: {imei}")
-                except UnicodeDecodeError:
-                    print(f"        -> [ERROR] IMEI (No se pudo decodificar): {sub_value_bytes.hex()}")
-
-        elif sub_id == 0x00C5: # Estado de Alarma Extendido (4 bytes)
+        if sub_id_int == 0x89FF: # ID Lógico: 0xFF89 (Estado Propietario Extendido)
             if value_length == 4:
-                # El valor es un DWORD (4 bytes), asumimos Big-Endian (como en JT/T 808)
+                # El valor en sí mismo es Big-Endian (DWORD)
+                status_prop_ext_int = int.from_bytes(sub_value_bytes, 'big')
+                
+                # Bit 0: Terminal sleep status (0: Activo, 1: Dormido)
+                sleep_status = "Dormido" if (status_prop_ext_int & 0b1) == 1 else "Activo"
+                # Bit 6: Is it lifted (0: Levantado, 1: No Levantado)
+                lift_status = "No Levantado" if (status_prop_ext_int >> 6) & 0b1 else "**LEVANTADO**"
+                
+                print(f"        -> **Estado Propietario Extendido (ID Lógico 0x0089)** (RAW): {sub_value_bytes.hex()} (Valor: {hex(status_prop_ext_int)})")
+                print(f"          > Estado de Suspensión (Bit 0): {sleep_status}")
+                print(f"          > Estado de Levantamiento (Bit 6): {lift_status}")
+            else:
+                 print(f"        -> **Estado Propietario Extendido (ID Lógico 0x0089)**: {sub_value_bytes.hex()}")
+
+        elif sub_id_int == 0xC5FF: # ID Lógico: 0xFFC5 (Estado de Alarma Extendido)
+            if value_length == 4:
+                # El valor es un DWORD (4 bytes), asumimos Big-Endian
                 status_ext_int = int.from_bytes(sub_value_bytes, 'big')
                 
                 # Bits 3 y 4: Estado de Posicionamiento Propietario
@@ -261,48 +262,63 @@ def parse_extended_eb_fields(additional_value):
                 vibration_bit = (status_ext_int >> 6) & 0b1
                 vibration_status = "Normal (No Vibración)" if vibration_bit == 1 else "**ALARMA DE VIBRACIÓN**"
                 
-                print(f"        -> **Estado de Alarma Extendido (RAW)**: {hex(status_ext_int)}")
-                print(f"        -> **Posicionamiento Adicional (Bits 3-4)**: {pos_status}")
-                print(f"        -> **Estado de Vibración (Bit 6)**: {vibration_status}")
+                print(f"        -> **Estado de Alarma Extendido (ID Lógico 0x00C5)** (RAW): {hex(status_ext_int)}")
+                print(f"          > Posicionamiento Adicional (Bits 3-4): {pos_status}")
+                print(f"          > Estado de Vibración (Bit 6): {vibration_status}")
 
-        elif sub_id == 0x00B9: # Información de Wi-Fi (Formato ASCII Mac,RSSI)
+        elif sub_id_int == 0x2D10: # ID Lógico: 0x102D
+            print(f"        -> **Voltaje del Dispositivo (ID Lógico 0x002D)**: **¡¡ESTE NO ES EL CAMPO DE VOLTAJE!!** El ID real debe ser 0x002D. Aquí se leyó 0x102D. (Valor RAW: {sub_value_bytes.hex()})")
+            # El campo de voltaje es 0x002D (4 bytes en el protocolo JT/T 808 estándar), pero aquí es 2 bytes
+            if sub_id_int == 0x7C00: # Intentamos decodificar si el ID fuera 0x007C
+                 if value_length == 2:
+                    voltage_mv = int.from_bytes(sub_value_bytes, 'big') 
+                    voltage_v = voltage_mv / 1000.0
+                    print(f"        -> **Voltaje (ID 0x002D/0x007C)**: {voltage_v:.3f} V (RAW: {voltage_mv} mV)")
+
+        elif sub_id_int == 0xA864: # ID Lógico: 0x64A8 (Porcentaje de Batería)
+            if value_length == 1:
+                percentage = sub_value_bytes[0]
+                print(f"        -> **Porcentaje de Batería (ID Lógico 0x00A8)**: {percentage} %")
+
+        elif sub_id_int == 0xD538: # ID Lógico: 0x38D5 (IMEI)
+            if value_length >= 15:
+                # Decodificamos solo los primeros 15 bytes
+                try:
+                    imei = sub_value_bytes[:15].decode('ascii').strip('\x00')
+                    print(f"        -> **IMEI del Dispositivo (ID Lógico 0x00D5)**: {imei}")
+                except UnicodeDecodeError:
+                    print(f"        -> [ERROR] IMEI (No se pudo decodificar): {sub_value_bytes.hex()}")
+
+        elif sub_id_int == 0xB905: # ID Lógico: 0x05B9 (Wi-Fi)
             try:
                 # El primer byte del valor es el conteo de redes (ej: 0x05)
                 count = sub_value_bytes[0]
                 wifi_data_bytes = sub_value_bytes[1:]
+                
+                # Limpiamos el byte de terminación si está presente al final de la cadena ASCII
+                if wifi_data_bytes.endswith(b'\x00'):
+                    wifi_data_bytes = wifi_data_bytes[:-1]
+                
                 wifi_data_string = wifi_data_bytes.decode('ascii')
                 
+                # Las entradas están separadas por comas, incluyendo MAC y RSSI
                 wifi_entries = wifi_data_string.split(',')
                 
-                print(f"        -> **Redes Wi-Fi Encontradas (0x00B9)** (Contador: {count}, Pares analizados: {len(wifi_entries)//2}):")
+                print(f"        -> **Redes Wi-Fi Encontradas (ID Lógico 0x00B9)** (Contador reportado: {count}, Pares analizados: {len(wifi_entries)//2}):")
                 for i in range(0, len(wifi_entries), 2):
                     if i + 1 < len(wifi_entries):
                         mac = wifi_entries[i]
                         rssi = wifi_entries[i+1]
                         print(f"          > MAC: {mac}, RSSI (dBm): {rssi}")
-            except (UnicodeDecodeError, IndexError) as e:
+            except (UnicodeDecodeError, IndexError, ValueError) as e:
                 print(f"        -> [ERROR] Error de decodificación de datos Wi-Fi: {e}")
+                print(f"          -> RAW WiFi Data: {sub_value_bytes.hex()}")
         
-        elif sub_id == 0x0089:
-            if value_length == 4:
-                status_prop_ext_int = int.from_bytes(sub_value_bytes, 'big')
-                # Bit 0: Terminal sleep status (0: Activo, 1: Dormido)
-                sleep_status = "Dormido" if (status_prop_ext_int & 0b1) == 1 else "Activo"
-                # Bit 6: Is it lifted (0: Levantado, 1: No Levantado)
-                lift_status = "No Levantado" if (status_prop_ext_int >> 6) & 0b1 else "**LEVANTADO**"
-                
-                print(f"        -> **Estado Propietario Extendido (0x0089)** (RAW): {sub_value_bytes.hex()} (Valor: {hex(status_prop_ext_int)})")
-                print(f"          > Estado de Suspensión (Bit 0): {sleep_status}")
-                print(f"          > Estado de Levantamiento (Bit 6): {lift_status}")
-            else:
-                 print(f"        -> **Estado Propietario Extendido (0x0089)**: {sub_value_bytes.hex()}")
-
-        elif sub_id == 0x00B2: 
-            # ICCID/Información SIM (Longitud de Valor 10 en la traza: 8951064012473110652f)
-            print(f"        -> **ICCID/Información SIM (0x00B2)**: {sub_value_bytes.hex()}")
+        elif sub_id_int == 0xB200: # ID Lógico: 0x00B2 (ICCID/Información SIM)
+            print(f"        -> **ICCID/Información SIM (ID Lógico 0x00B2)**: {sub_value_bytes.hex()}")
 
         else:
-            print(f"        -> ID {hex(sub_id)} (No Mapeado): {sub_value_bytes.hex()}")
+            print(f"        -> ID {hex(sub_id_int)} (No Mapeado o ID Invertido): {sub_value_bytes.hex()}")
         
         sub_current_byte = value_end
         
@@ -557,4 +573,3 @@ def start_server():
 # --- Punto de Entrada del Programa (Original) ---
 if __name__ == "__main__":
     start_server()
-
