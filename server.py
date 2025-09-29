@@ -1,6 +1,5 @@
 import struct
 from datetime import datetime
-import json # Necesario para la función de respuesta del servidor (8001)
 
 class JT808Decoder:
     """
@@ -15,18 +14,17 @@ class JT808Decoder:
         self.status_map = {
             0: "ACC: Apagado (OFF)",
             1: "ACC: Encendido (ON)",
-            # El bit 1 determina el estado de posicionamiento: 0=No Posicionado, 1=Posicionado
         }
         
-        # Corrección de longitud forzada para el bloque 0xEB.
-        # Esto es vital para manejar las inconsistencias del protocolo propietario.
+        # Corrección de longitud forzada para el bloque 0xEB (Información Extendida Propietaria).
+        # Esto corrige las inconsistencias de longitud observadas en el protocolo del dispositivo.
         self.eb_field_lengths = {
             0x0089: 6,   # Estado extendido
             0x00C5: 6,   # Alarma extendida
-            0x002D: 2,   # Voltaje (Corregido a 2 bytes de valor, ej: 11F7 = 4600mV)
-            0x00A8: 1,   # Porcentaje de batería (Corregido a 1 byte de valor, ej: 64 = 100%)
+            0x002D: 2,   # Voltaje (Se corrige a 2 bytes de valor)
+            0x00A8: 1,   # Porcentaje de batería (Se corrige a 1 byte de valor)
             0x00D5: 15,  # IMEI
-            0x00B9: -1   # Información WiFi (longitud variable, consume el resto del paquete)
+            0x00B9: -1   # Información WiFi (longitud variable, se consume el resto)
         }
 
     def _hex_to_bytes(self, hex_string):
@@ -59,9 +57,8 @@ class JT808Decoder:
     def _decode_position_status(self, status_dword):
         """Decodifica los bits de estado de la posición."""
         acc_status = self.status_map[status_dword & 0b1]
-        
         pos_bit = (status_dword >> 1) & 0b1
-        pos_status = "Posicionamiento: Posicionado" if pos_bit == 1 else "Posicionamiento: No Posicionado"
+        pos_status = "Posicionado" if pos_bit == 1 else "No Posicionado"
 
         return {
             "RAW": f"0x{status_dword:08X}",
@@ -70,7 +67,7 @@ class JT808Decoder:
         }
 
     def _decode_time(self, bcd_bytes):
-        """Decodifica la hora BCD (YYMMDDhhmmss) a un objeto datetime."""
+        """Decodifica la hora BCD (YYMMDDhhmmss)."""
         bcd_str = self._decode_bcd(bcd_bytes)
         try:
             year = int(bcd_str[0:2]) + 2000
@@ -79,7 +76,6 @@ class JT808Decoder:
             hour = int(bcd_str[6:8])
             minute = int(bcd_str[8:10])
             second = int(bcd_str[10:12])
-            # Nota: El dispositivo reporta en UTC+8 (ajustar en la aplicación de servidor si es necesario)
             return datetime(year, month, day, hour, minute, second).strftime("%Y-%m-%d %H:%M:%S")
         except:
             return "Fecha/Hora Inválida"
@@ -88,37 +84,30 @@ class JT808Decoder:
         """Formatea los valores conocidos del bloque propietario (0xEB)."""
         value_hex = value_bytes.hex()
         
-        # ID 0x002D: Voltaje (2 bytes)
-        if field_id == 0x002D and len(value_bytes) >= 2: 
+        if field_id == 0x002D and len(value_bytes) >= 2: # Voltaje
             voltage_mv = struct.unpack('>H', value_bytes[0:2])[0]
             voltage_v = voltage_mv / 1000.0
             return f"{voltage_v:.2f} V ({voltage_mv} mV)"
 
-        # ID 0x00A8: Porcentaje de Batería (1 byte)
-        if field_id == 0x00A8 and len(value_bytes) >= 1: 
+        if field_id == 0x00A8 and len(value_bytes) >= 1: # Porcentaje de Batería
             battery_perc = value_bytes[0]
             return f"{battery_perc}%"
         
-        # ID 0x00D5: IMEI (15 bytes)
-        if field_id == 0x00D5: 
+        if field_id == 0x00D5: # IMEI
             imei = value_bytes.decode('ascii', errors='ignore').strip('\x00')
             return imei
         
-        # ID 0x00B9: Información WiFi (variable)
-        if field_id == 0x00B9: 
+        if field_id == 0x00B9: # Información WiFi
             try:
                 wifi_data = value_bytes.decode('ascii', errors='ignore')
                 return wifi_data
             except:
                 return f"RAW: {value_hex}"
         
-        # Otros IDs
         return f"RAW: {value_hex}"
 
     def decode_proprietary_eb(self, eb_bytes):
-        """
-        Decodifica el bloque de Información Extendida Propietaria (0xEB).
-        """
+        """Decodifica el bloque de Información Extendida Propietaria (0xEB)."""
         results = {}
         ptr = 0
         
@@ -127,23 +116,20 @@ class JT808Decoder:
             results["ERROR_HEADER"] = "Longitud insuficiente para encabezado EB."
             return results
         
-        results["Encabezado Propietario (RAW)"] = eb_bytes[0:EB_HEADER_LEN].hex()
-        ptr += EB_HEADER_LEN
-
+        ptr += EB_HEADER_LEN # Saltar el encabezado
+        
         while ptr < len(eb_bytes):
             try:
-                # La estructura es: Longitud (WORD) | ID (WORD)
                 if ptr + 4 > len(eb_bytes):
-                     results["ERROR_BREAK"] = f"Datos insuficientes para leer ID/Longitud en posición {ptr}. Rompiendo ciclo."
+                     results["ERROR_BREAK"] = f"Datos insuficientes para leer ID/Longitud en posición {ptr}."
                      break
 
                 field_len_raw, field_id = struct.unpack('>HH', eb_bytes[ptr:ptr+4])
                 ptr += 4
                 
-                # REPARACIÓN: Usamos la longitud forzada o la reportada
                 value_len = self.eb_field_lengths.get(field_id, field_len_raw)
                 
-                if field_id == 0x00B9: # Consumir el resto del bloque para WiFi
+                if field_id == 0x00B9:
                     value_len = len(eb_bytes) - ptr
                 
                 if ptr + value_len > len(eb_bytes):
@@ -153,7 +139,6 @@ class JT808Decoder:
                 value_bytes = eb_bytes[ptr:ptr + value_len]
                 ptr += value_len
                 
-                # Almacenar el resultado en el formato final
                 field_name = {
                     0x0089: "Estado_Extendido",
                     0x00C5: "Alarma_Extendida",
@@ -172,15 +157,12 @@ class JT808Decoder:
         return results
 
     def decode_tlv_additional_info(self, body_bytes):
-        """
-        Decodifica los bloques de Información Adicional (TLV) del cuerpo principal.
-        """
+        """Decodifica los bloques de Información Adicional (TLV)."""
         results = {}
         ptr = 0
         
         while ptr < len(body_bytes):
             try:
-                # ID (BYTE) y Longitud (BYTE)
                 if ptr + 2 > len(body_bytes):
                     results["ERROR_TLV"] = f"Fin inesperado al leer ID/Len en {ptr}."
                     break
@@ -196,7 +178,6 @@ class JT808Decoder:
                 value_bytes = body_bytes[ptr:ptr + field_len]
                 ptr += field_len
                 
-                # Manejo de IDs conocidos (y llamada al decoder EB)
                 if field_id == 0x30:
                     results["Fuerza_Senal"] = value_bytes[0]
                 elif field_id == 0x33:
@@ -214,18 +195,13 @@ class JT808Decoder:
         return results
 
     def decode_position_report(self, raw_hex_data: str) -> dict:
-        """
-        Procesa y decodifica el paquete completo de reporte de posición (0x0200).
-        Retorna un diccionario con los datos decodificados.
-        """
+        """Procesa y decodifica el paquete completo de reporte de posición (0x0200)."""
         output = {"status": "FAILURE"}
 
-        # 1. Validación y Des-escapación
         if not raw_hex_data.startswith('7e') or not raw_hex_data.endswith('7e') or len(raw_hex_data) < 10:
             output["error"] = "Trama HEX inválida (falta flag 0x7E o es demasiado corta)."
             return output
         
-        # Cuerpo y Checksum (excluyendo flags 7e)
         escaped_body = raw_hex_data[2:-4] 
         checksum_hex = raw_hex_data[-4:-2]
         
@@ -236,7 +212,6 @@ class JT808Decoder:
             output["error"] = "Fallo al convertir la trama des-escapada a bytes."
             return output
         
-        # 2. Validación de Checksum
         calculated_checksum = self._xor_checksum(descaped_body_bytes)
         expected_checksum = int(checksum_hex, 16)
         
@@ -246,7 +221,7 @@ class JT808Decoder:
         
         ptr = 0
         try:
-            # 3. Decodificación de Encabezado (12 bytes)
+            # Encabezado (12 bytes)
             if len(descaped_body_bytes) < 12: raise Exception("Cuerpo de mensaje demasiado corto para el encabezado.")
             msg_id, body_len, terminal_phone_bcd, serial_num = struct.unpack('>HH6sH', descaped_body_bytes[ptr:ptr+12])
             ptr += 12
@@ -263,7 +238,7 @@ class JT808Decoder:
                 output["error"] = f"ID de Mensaje inesperado: 0x{msg_id:04X}"
                 return output
 
-            # 4. Decodificación de Posición (28 bytes)
+            # Posición (28 bytes)
             if ptr + 28 > len(descaped_body_bytes): raise Exception("Cuerpo de mensaje demasiado corto para el bloque de posición.")
                 
             (alarm_flag, status_dword, latitude_raw, longitude_raw, altitude, 
@@ -284,8 +259,7 @@ class JT808Decoder:
                 "report_time": self._decode_time(time_bcd)
             }
 
-            # 5. Decodificación de Información Adicional (TLV)
-            # USAMOS EL RESTO DEL BUFFER para robustez
+            # Información Adicional (TLV) - Usamos el resto del buffer
             additional_info_bytes = descaped_body_bytes[ptr:] 
             output["additional_info"] = self.decode_tlv_additional_info(additional_info_bytes)
             
@@ -300,22 +274,14 @@ class JT808Decoder:
     def create_response_8001(self, original_message_id: int, terminal_id_bcd_hex: str, original_serial_number: int, result: int = 0) -> str:
         """
         Genera la trama de respuesta 0x8001 (Respuesta general de la plataforma).
-        :param original_message_id: ID del mensaje original (ej: 0x0200 o 512).
-        :param terminal_id_bcd_hex: Número de terminal BCD en formato HEX (ej: '087077138206').
-        :param original_serial_number: Número de serie del mensaje original (ej: 32).
-        :param result: 0 (Éxito), 1 (Fallo), etc.
-        :return: Trama HEX lista para enviar.
         """
-        # 5 bytes de cuerpo: ID Mensaje Original (WORD), Serial Original (WORD), Resultado (BYTE)
+        # Cuerpo de la respuesta: ID Mensaje Original (WORD), Serial Original (WORD), Resultado (BYTE)
         body_data = struct.pack('>HBH', original_message_id, result, original_serial_number)
         
-        # Encabezado: ID Mensaje (WORD 0x8001), Longitud Cuerpo (WORD len(body_data)), ID Terminal (BCD 6 bytes), Serial (WORD)
         terminal_id_bytes = self._hex_to_bytes(terminal_id_bcd_hex)
-        
-        # El número de serie de la respuesta se suele calcular incrementalmente o usando un valor
-        # fijo, pero en el log original se usó el serial del mensaje original, así que lo replicamos aquí.
         response_serial = original_serial_number 
         
+        # Encabezado: ID Mensaje (WORD 0x8001), Longitud Cuerpo (WORD), ID Terminal (BCD 6 bytes), Serial (WORD)
         response_header = struct.pack('>HH6sH', 0x8001, len(body_data), terminal_id_bytes, response_serial)
         
         response_trama_data = response_header + body_data
@@ -324,5 +290,3 @@ class JT808Decoder:
         response_hex = f"7e{response_trama_data.hex()}{checksum:02x}7e"
         
         return response_hex.upper()
-
-
