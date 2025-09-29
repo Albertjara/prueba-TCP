@@ -73,15 +73,28 @@ def parse_status_bits(status_raw):
     status_int = int.from_bytes(status_raw, 'big')
     
     # Extraemos el estado de posicionamiento (Bits 1 y 2)
+    # 00: Sin pos, 10: GPS (Bit 1), 01: WiFi (Bit 2), 11: GPS y WiFi
     pos_bits = (status_int >> 1) & 0b11
-    pos_status = POS_BIT_MAP.get(pos_bits, "Tipo de posicionamiento Desconocido")
+    
+    # Invertimos el orden de los bits para el mapeo: Bit 2 (WiFi) es el más significativo aquí.
+    # El mapeo se basa en los bits 1 y 2
+    if (status_int >> 1) & 0b1: # Bit 1 (Posicionamiento GPS)
+        if (status_int >> 2) & 0b1: # Bit 2 (Posicionamiento WiFi)
+            pos_status = POS_BIT_MAP[3] # GPS y Wi-Fi
+        else:
+            pos_status = POS_BIT_MAP[1] # Solo GPS
+    elif (status_int >> 2) & 0b1: # Bit 2 (Posicionamiento WiFi)
+        pos_status = POS_BIT_MAP[2] # Solo Wi-Fi
+    else:
+        pos_status = POS_BIT_MAP[0] # Sin Posicionamiento
+
 
     # Extraemos el bit de ACC (Bit 0)
     acc_status = "Encendido (ACC ON)" if (status_int & 0b1) == 1 else "Apagado (ACC OFF)"
     
-    # Ejemplo de otros bits estándar (JT/T 808):
-    latitude_type = "Sur (S)" if (status_int >> 2) & 0b1 else "Norte (N)"
-    longitude_type = "Oeste (W)" if (status_int >> 3) & 0b1 else "Este (E)"
+    # Otros bits estándar (JT/T 808):
+    latitude_type = "Sur (S)" if (status_int >> 29) & 0b1 else "Norte (N)" # Bit 29 (JT/T 808)
+    longitude_type = "Oeste (W)" if (status_int >> 30) & 0b1 else "Este (E)" # Bit 30 (JT/T 808)
 
     return {
         "Raw Hex": status_raw.hex(),
@@ -89,7 +102,7 @@ def parse_status_bits(status_raw):
         "Posicionamiento": pos_status,
         "Tipo Latitud": latitude_type,
         "Tipo Longitud": longitude_type,
-        "Bits Desconocidos/Reservados": hex(status_int >> 4) # Mostramos el resto
+        "Valor RAW Completo": hex(status_int)
     }
 
 # --- Función para parsear sub-campos de la trama extendida 0xEB ---
@@ -100,36 +113,37 @@ def parse_extended_eb_fields(additional_value):
     """
     sub_data = additional_value
     
-    # Saltamos el encabezado inicial '000c00' (3 bytes)
+    # Saltamos el encabezado inicial '000c00' (3 bytes) que parece ser ruido o un campo vacío.
     sub_current_byte = 3 
     
-    print("    - INICIO DE DECODIFICACIÓN DETALLADA DE 0xEB:")
+    print("    - INICIO DE DECODIFICACIÓN DETALLADA DE 0xEB (Información Extendida):")
     
     while sub_current_byte < len(sub_data):
         # 1. Leer Longitud del Bloque (2 bytes)
-        if sub_current_byte + 2 > len(sub_data):
-            break
+        if sub_current_byte + 2 > len(sub_data): break
             
         sub_length_block = int.from_bytes(sub_data[sub_current_byte:sub_current_byte+2], 'big')
 
         # 2. Leer ID del Bloque (2 bytes)
         id_start = sub_current_byte + 2
+        if id_start + 2 > len(sub_data): break
         sub_id = int.from_bytes(sub_data[id_start:id_start+2], 'big')
         
         # 3. Calcular Longitud y Bytes del Valor
         value_start = id_start + 2
+        # La longitud del valor es la longitud total del bloque menos los 2 bytes del ID
         value_length = sub_length_block - 2 
         value_end = value_start + value_length
 
         if value_end > len(sub_data):
-            print(f"      [ERROR] Longitud de valor inválida para el campo {hex(sub_id)}. Posición actual: {sub_current_byte}")
+            print(f"      [ERROR] Longitud de valor inválida para el campo {hex(sub_id)}.")
             break
             
         sub_value_bytes = sub_data[value_start:value_end]
         
         print(f"      > Campo ID: {hex(sub_id)} | Longitud Valor: {value_length} bytes | HEX: {sub_value_bytes.hex()}")
 
-        if sub_id == 0x002D: # Voltaje (2 bytes, mV)
+        if sub_id == 0x002D: # Valor de Voltaje (2 bytes, mV)
             if value_length == 2:
                 voltage_mv = int.from_bytes(sub_value_bytes, 'big')
                 voltage_v = voltage_mv / 1000.0
@@ -146,17 +160,18 @@ def parse_extended_eb_fields(additional_value):
                     imei = sub_value_bytes.decode('ascii')
                     print(f"        -> **IMEI del Dispositivo**: {imei}")
                 except UnicodeDecodeError:
-                    print(f"        -> IMEI (Error de decodificación): {sub_value_bytes.hex()}")
+                    print(f"        -> [ERROR] IMEI (No se pudo decodificar como ASCII): {sub_value_bytes.hex()}")
 
         elif sub_id == 0x00C5: # Estado de Alarma Extendido (4 bytes)
             if value_length == 4:
                 status_ext_int = int.from_bytes(sub_value_bytes, 'big')
+                
                 # Bit 2 (0x4): Carga/Alimentación (0: No Cargando, 1: Cargando)
                 charging_bit = (status_ext_int >> 2) & 0b1
                 charging_status = CHARGING_STATUS_MAP.get(charging_bit, "Desconocido")
-                
                 print(f"        -> **Estado de Carga/Alimentación**: {charging_status}")
-                # Bit 6 (0x40): Alarma de Vibración (1: Normal, 0: Alarma) - No está claro en la documentación si es invertido.
+                
+                # Bit 6 (0x40): Alarma de Vibración (1: Normal, 0: Alarma)
                 vibration_bit = (status_ext_int >> 6) & 0b1
                 vibration_status = "Normal (No Vibración)" if vibration_bit == 1 else "Alarma de Vibración"
                 print(f"        -> Estado de Vibración (Bit 6): {vibration_status}")
@@ -172,14 +187,14 @@ def parse_extended_eb_fields(additional_value):
                         rssi = wifi_entries[i+1]
                         print(f"          > MAC: {mac}, RSSI (dBm): {rssi}")
             except (UnicodeDecodeError, IndexError):
-                print(f"        -> Error de decodificación de datos Wi-Fi.")
+                print(f"        -> [ERROR] Error de decodificación de datos Wi-Fi.")
         
         elif sub_id == 0x00B2: # ICCID
             iccid = sub_value_bytes.hex()
             print(f"        -> **ICCID de la SIM**: {iccid}")
 
         else:
-            print(f"        -> [Campo Desconocido]: {sub_value_bytes.hex()}")
+            print(f"        -> ID {hex(sub_id)} (No Mapeado): {sub_value_bytes.hex()}")
         
         sub_current_byte = value_end
         
@@ -255,17 +270,27 @@ def handle_client(conn, addr):
                 print("  --> Tipo de Mensaje: REGISTRO DE TERMINAL (0x0100) - INICIANDO LOGIN")
                 
                 # Campos de Registro (Cuerpo 0x0100): Provincia (2), Ciudad (2), Fabricante (5 ASCII), Modelo (20 ASCII), ID Terminal (7 bytes BCD)
-                manufacturer_id = message_body[4:9].decode('ascii')
-                model_terminal = message_body[9:29].decode('ascii').strip('\x00')
                 
-                print(f"    - ID Fabricante: {manufacturer_id}, Modelo: {model_terminal}")
-
-                response_message_id = 0x8100 # Respuesta de registro de terminal
-                auth_code = b"AUTH_CODE_BSJ_2025" # Código de autenticación
+                # FIX CRÍTICO DE ENCODING: Usamos 'latin-1' en lugar de 'ascii' para manejar bytes binarios
+                # que el dispositivo envía como padding en el campo Modelo, evitando el crash.
+                try:
+                    manufacturer_id = message_body[4:9].decode('latin-1').strip('\x00').strip()
+                    model_terminal = message_body[9:29].decode('latin-1').strip('\x00').strip()
+                    
+                    print(f"    - ID Fabricante: {manufacturer_id}")
+                    print(f"    - Modelo de Terminal: {model_terminal}")
+                    
+                    response_message_id = 0x8100 # Respuesta de registro de terminal
+                    auth_code = b"AUTH_CODE_BSJ_2025" # Código de autenticación
+                    
+                    # Cuerpo 0x8100: Serial (2) + Resultado (1) + Código Autenticación (N)
+                    response_body = message_serial_number_raw + response_result.to_bytes(1, 'big') + auth_code
+                    print(f"    -> [RESPUESTA] Envío de Código de Autenticación: {auth_code.decode('latin-1')}")
+                except Exception as e:
+                    print(f"    [ERROR DE DECODIFICACIÓN] Fallo al leer campos de texto del registro: {e}")
+                    response_message_id = None # No respondemos si falló el parsing
+                    response_result = 0x01
                 
-                # Cuerpo 0x8100: Serial (2) + Resultado (1) + Código Autenticación (N)
-                response_body = message_serial_number_raw + response_result.to_bytes(1, 'big') + auth_code
-                print(f"    -> [RESPUESTA] Envío de Código de Autenticación: {auth_code.decode()}")
 
             elif message_id == 0x0102:
                 print("  --> Tipo de Mensaje: AUTENTICACIÓN DE TERMINAL (0x0102)")
@@ -296,6 +321,7 @@ def handle_client(conn, addr):
                     time_str = f"20{time_raw[0]:02x}-{time_raw[1]:02x}-{time_raw[2]:02x} {time_raw[3]:02x}:{time_raw[4]:02x}:{time_raw[5]:02x} GMT+8"
                     
                     print("  --- Información de Posición Básica ---")
+                    print(f"  - Estado (RAW): {status_data['Valor RAW Completo']}")
                     print(f"  - Posicionamiento: **{status_data['Posicionamiento']}**")
                     print(f"  - Estado del ACC: {status_data['Estado ACC']}")
                     print(f"  - Latitud: {latitude:.6f} ({status_data['Tipo Latitud']})")
@@ -343,6 +369,11 @@ def handle_client(conn, addr):
                 # Reconocimiento general para el reporte de posición
                 response_message_id = 0x8001
                 response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
+
+            elif message_id == 0x0003:
+                print("  --> Tipo de Mensaje: CIERRE DE SESIÓN (0x0003). No se requiere respuesta específica, solo ACK general.")
+                # No necesitamos una respuesta especial, un ACK implícito del TCP es suficiente.
+                response_message_id = None # Opcional: Podríamos enviar 0x8001 si fuera necesario
 
             else:
                 print(f"  --> Tipo de Mensaje: ID DESCONOCIDO {hex(message_id)}. No se requiere respuesta.")
