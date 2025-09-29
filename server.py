@@ -17,6 +17,7 @@ TIMEOUT_IN_SECONDS = 30 * 60
 MODE_MAP = {
     0x00: "Modo Normal (Seguimiento Continuo)",
     0x01: "Modo de Ultra-larga duración (Ahorro de energía)",
+    0x04: "Modo de Punto Residente (Ahorro de energía inteligente)", # Añadido según documentación
 }
 
 # --- Función para Des-escapar Bytes JT/T 808 ---
@@ -200,177 +201,27 @@ def parse_status_bits(status_raw):
     # Bit 1: Posicionamiento (0x0200 estándar JT/T 808)
     pos_bit_std = (status_int >> 1) & 0b1
     pos_status_std = "Posicionado (GPS/BDS/GLONASS)" if pos_bit_std == 0 else "No Posicionado" 
-    pos_status_std_alt = "Posicionado (Asunción Inversa)" if pos_bit_std == 1 else "No Posicionado (Asunción Inversa)"
+    # El dispositivo parece usar esta lógica: 0 = Posicionado, 1 = No Posicionado.
+    pos_status_std_alt = "Posicionado" if pos_bit_std == 0 else "No Posicionado"
 
     # Bit 29: Tipo Latitud (0: Norte, 1: Sur)
     latitude_type = "Sur (S)" if (status_int >> 29) & 0b1 else "Norte (N)" 
     
     # Bit 30: Tipo Longitud (0: Este, 1: Oeste)
     longitude_type = "Oeste (W)" if (status_int >> 30) & 0b1 else "Este (E)" 
+    
+    # Bit 31: GPS cifrado (0: No cifrado, 1: Cifrado)
+    encryption_status = "Cifrada" if (status_int >> 31) & 0b1 else "No Cifrada"
 
     return {
         "Raw Hex": status_raw.hex(),
         "Estado ACC": acc_status,
-        "Estado Posición Estándar (Bit 1)": pos_status_std,
-        "Estado Posición (Asunción Inversa)": pos_status_std_alt,
+        "Estado Posición": pos_status_std_alt,
         "Tipo Latitud": latitude_type,
         "Tipo Longitud": longitude_type,
+        "Cifrado GPS": encryption_status,
         "Valor RAW Completo": hex(status_int)
     }
-
-# --- Función para parsear sub-campos de la trama extendida 0xEB (Proprietaria) ---
-def parse_extended_eb_fields(additional_value):
-    """
-    Analiza la sub-trama extendida (ID 0xeb) utilizando la estructura propietaria L(2)-ID(2)-Valor(L-2).
-    Longitud L (2 bytes) = Longitud de ID (2 bytes) + Longitud de Valor (V bytes)
-    """
-    sub_data = additional_value
-    
-    # El protocolo tiene un encabezado fijo propietario de 15 bytes antes de los campos L-ID-Valor.
-    initial_offset = 15
-    sub_current_byte = initial_offset
-    
-    print("    - INICIO DE DECODIFICACIÓN DETALLADA DE 0xEB (Información Extendida Propietaria):")
-    print(f"      [DEBUG] Saltando {initial_offset} bytes de encabezado propietario: {sub_data[0:initial_offset].hex()}")
-
-    if sub_current_byte >= len(sub_data):
-        print("      [AVISO] No hay datos restantes después de saltar el encabezado de 15 bytes.")
-        return
-
-    while sub_current_byte < len(sub_data):
-        
-        # 1. Leer Longitud Total del Bloque (L, 2 bytes, Big-Endian)
-        if sub_current_byte + 2 > len(sub_data): 
-            print(f"      [AVISO] Datos insuficientes para leer la longitud total del bloque. Posición: {sub_current_byte}. Rompiendo ciclo.")
-            break
-            
-        sub_length_block = int.from_bytes(sub_data[sub_current_byte:sub_current_byte+2], 'big')
-        
-        # 2. Leer ID del Bloque (T, 2 bytes, Big-Endian)
-        id_start = sub_current_byte + 2
-        if id_start + 2 > len(sub_data): 
-            print(f"      [AVISO] Datos insuficientes para leer el ID del bloque. Posición: {id_start}. Rompiendo ciclo.")
-            break
-            
-        sub_id_raw_full = sub_data[id_start:id_start+2]
-        # El ID Lógico para el mapeo es el byte menos significativo (LSB) del campo ID (T).
-        sub_id_int_1byte = sub_id_raw_full[1] 
-        # Para impresión, usamos el valor completo como 0x00XX
-        logical_id_for_print = int.from_bytes(b'\x00' + sub_id_raw_full[1].to_bytes(1, 'big'), 'big')
-        
-        # 3. Calcular Longitud y Bytes del Valor
-        value_start = id_start + 2
-        
-        # La longitud del valor es la longitud total del bloque (L) - 2 bytes de ID (T)
-        value_length = sub_length_block - 2 
-        
-        if value_length < 0 or sub_length_block < 2:
-              print(f"      [ERROR] Longitud de valor calculada inválida ({value_length}) para el campo {hex(logical_id_for_print)}. Rompiendo ciclo.")
-              break
-        
-        value_end = value_start + value_length
-
-        if value_end > len(sub_data):
-            print(f"      [ERROR] Longitud de valor inválida ({value_length} bytes) para el campo {hex(logical_id_for_print)}. Fin esperado: {value_end}. Real: {len(sub_data)}. Rompiendo ciclo.")
-            break
-            
-        sub_value_bytes = sub_data[value_start:value_end]
-        
-        print(f"      > Campo ID (RAW): {sub_id_raw_full.hex()} | ID Lógico: {hex(logical_id_for_print)} | Longitud Valor: {value_length} bytes | HEX: {sub_value_bytes.hex()}")
-
-        # --- Decodificación Específica por ID Lógico (LSB) ---
-        
-        if sub_id_int_1byte == 0x89: # Estado Propietario Extendido (4 bytes)
-            if value_length == 4:
-                status_prop_ext_int = int.from_bytes(sub_value_bytes, 'big')
-                
-                # Bit 0: Estado de suspensión del terminal (0: Activo, 1: Dormido)
-                sleep_status = "Dormido" if (status_prop_ext_int & 0b1) == 1 else "Activo"
-                # Bit 6: Is it lifted (0: No Levantado/Normal, 1: Levantamiento/Alarma)
-                lift_status = "**LEVANTADO**" if (status_prop_ext_int >> 6) & 0b1 else "Normal (No Levantado)"
-                
-                print(f"        -> **Estado Propietario Extendido (ID 0x0089)** (RAW): {sub_value_bytes.hex()} (Valor: {hex(status_prop_ext_int)})")
-                print(f"          > Estado de Suspensión (Bit 0): {sleep_status}")
-                print(f"          > Estado de Levantamiento (Bit 6): {lift_status}")
-            else:
-                  print(f"        -> **Estado Propietario Extendido (ID 0x0089)**: Longitud inesperada de {value_length} bytes.")
-
-        elif sub_id_int_1byte == 0xC5: # Estado de Alarma Extendido (4 bytes)
-            if value_length == 4:
-                status_ext_int = int.from_bytes(sub_value_bytes, 'big')
-                
-                # Bits 3 y 4: Estado de Posicionamiento Propietario
-                pos_bits = (status_ext_int >> 3) & 0b11
-                if pos_bits == 0b10: pos_status = "Posicionamiento GPS"
-                elif pos_bits == 0b01: pos_status = "Posicionamiento Wi-Fi"
-                elif pos_bits == 0b11: pos_status = "Posicionamiento GPS y Wi-Fi"
-                else: pos_status = "Sin Posicionamiento"
-
-                # Bit 6: Alarma de Vibración (1: Normal, 0: Alarma)
-                vibration_bit = (status_ext_int >> 6) & 0b1
-                vibration_status = "Normal (No Vibración)" if vibration_bit == 1 else "**ALARMA DE VIBRACIÓN**"
-                
-                print(f"        -> **Estado de Alarma Extendido (ID 0x00C5)** (RAW): {hex(status_ext_int)}")
-                print(f"          > Posicionamiento Adicional (Bits 3-4): {pos_status}")
-                print(f"          > Estado de Vibración (Bit 6): {vibration_status}")
-
-            elif sub_id_int_1byte == 0x2D: # Voltaje del Dispositivo (2 bytes, mV)
-                # L=4, Longitud de Valor=2.
-                if value_length == 2:
-                    # El valor del voltaje (mV) se lee como BE
-                    voltage_mv = int.from_bytes(sub_value_bytes, 'big') 
-                    voltage_v = voltage_mv / 1000.0
-                    print(f"        -> **Voltaje (ID 0x002D)**: **{voltage_v:.3f} V** (RAW: {voltage_mv} mV)")
-                else:
-                      print(f"        -> **Voltaje (ID 0x002D)**: Longitud inesperada de {value_length} bytes.")
-
-            elif sub_id_int_1byte == 0xA8: # Porcentaje de Batería (1 byte)
-                # L=3, Longitud de Valor=1.
-                if value_length == 1:
-                    percentage = sub_value_bytes[0]
-                    print(f"        -> **Porcentaje de Batería (ID 0x00A8)**: **{percentage} %**")
-                else:
-                      print(f"        -> **Porcentaje de Batería (ID 0x00A8)**: Longitud inesperada de {value_length} bytes.")
-
-            elif sub_id_int_1byte == 0xD5: # IMEI (15 bytes)
-                # L=17, Longitud de Valor=15.
-                if value_length >= 15:
-                    try:
-                        # El IMEI se decodifica como ASCII o BCD
-                        imei = sub_value_bytes[:15].decode('ascii', errors='ignore').strip('\x00')
-                        print(f"        -> **IMEI del Dispositivo (ID 0x00D5)**: {imei}")
-                    except UnicodeDecodeError:
-                        print(f"        -> [ERROR] IMEI (No se pudo decodificar): {sub_value_bytes.hex()}")
-
-            elif sub_id_int_1byte == 0xB9: # Wi-Fi
-                if sub_value_bytes:
-                    try:
-                        count = sub_value_bytes[0]
-                        wifi_data_bytes = sub_value_bytes[1:]
-                        
-                        # Los datos Wi-Fi son una cadena de pares MAC,RSSI separados por comas
-                        wifi_data_string = wifi_data_bytes.decode('ascii', errors='ignore').strip('\x00').strip()
-                        wifi_entries = [e for e in wifi_data_string.split(',') if e]
-                        
-                        print(f"        -> **Redes Wi-Fi Encontradas (ID 0x00B9)** (Contador: {count}, Pares: {len(wifi_entries)//2}):")
-                        for i in range(0, len(wifi_entries), 2):
-                            if i + 1 < len(wifi_entries):
-                                mac = wifi_entries[i]
-                                rssi = wifi_entries[i+1]
-                                print(f"          > MAC: {mac}, RSSI (dBm): {rssi}")
-                    except Exception as e:
-                        print(f"        -> [ERROR] Error de decodificación de datos Wi-Fi: {e}")
-                else:
-                      print("        -> **Redes Wi-Fi Encontradas (ID 0x00B9)**: Datos de Wi-Fi vacíos.")
-        
-            else:
-                print(f"        -> ID {hex(logical_id_for_print)} (No Mapeado): {sub_value_bytes.hex()}")
-        
-        # Avanzar al inicio del siguiente bloque: 2 bytes L + L bytes (ID + Value)
-        sub_current_byte = sub_current_byte + 2 + sub_length_block
-        
-    print("    - FIN DE DECODIFICACIÓN DETALLADA DE 0xEB.")
-
 
 # --- Función para decodificar la Respuesta de Parámetros (0x0104) ---
 def parse_query_parameters_response(message_body):
@@ -576,52 +427,188 @@ def handle_client(conn, addr):
                     
                     print("  --- Información de Posición Básica ---")
                     print(f"  - Estado (RAW): {status_data['Valor RAW Completo']}")
-                    print(f"  - Posicionamiento Estándar (Bit 1): **{status_data['Estado Posición (Asunción Inversa)']}**")
+                    print(f"  - Posicionamiento Estándar (Bit 1): **{status_data['Estado Posición']}**")
                     print(f"  - Estado del ACC (Bit 0): {status_data['Estado ACC']}")
+                    print(f"  - Cifrado GPS (Bit 31): {status_data['Cifrado GPS']}")
                     print(f"  - Latitud: {latitude:.6f} ({status_data['Tipo Latitud']})")
                     print(f"  - Longitud: {longitude:.6f} ({status_data['Tipo Longitud']})")
                     print(f"  - Hora del Reporte: {time_str}")
 
-                    # --- ANÁLISIS DE LA INFORMACIÓN ADICIONAL (ID 1 byte) ---
+                    # --- ANÁLISIS DE LA INFORMACIÓN ADICIONAL (Estructuras: ID(1)-L(1)-Valor O ID(2)-L(1)-Valor) ---
                     # Comienza después de los 28 bytes fijos
                     additional_info_start = 28
                     if len(message_body) > additional_info_start:
-                        print("  --- Información Adicional del Cuerpo (Estructura ID(1)-L(1)-Valor) ---")
+                        print("  --- Información Adicional del Cuerpo ---")
                         current_byte = additional_info_start
                         while current_byte < len(message_body):
-                            # Asegurar que hay al menos 2 bytes para ID y Longitud
-                            if current_byte + 2 > len(message_body): break
-
-                            additional_id = message_body[current_byte]
-                            additional_length = message_body[current_byte+1]
+                            # Los campos pueden ser de 1 byte (estándar) o 2 bytes (propietario)
+                            # Se asume que si el siguiente byte es 0x00, es un ID de 2 bytes (0x00XX)
                             
-                            start_value = current_byte + 2
+                            # Intentar leer el ID como 2 bytes primero (propietario)
+                            if current_byte + 3 <= len(message_body) and message_body[current_byte] == 0x00:
+                                # ID de 2 bytes (Propietario): ID(2) + Longitud(1) + Valor(L)
+                                additional_id_raw = message_body[current_byte:current_byte+2]
+                                additional_id = int.from_bytes(additional_id_raw, 'big') # e.g., 0x00B2
+                                additional_length = message_body[current_byte+2]
+                                id_size = 2
+                                length_size = 1
+                                current_byte += 3
+                            
+                            # ID de 1 byte (Estándar/Algunos Propietarios): ID(1) + Longitud(1) + Valor(L)
+                            elif current_byte + 2 <= len(message_body):
+                                additional_id = message_body[current_byte] # e.g., 0x33, 0x30
+                                additional_length = message_body[current_byte+1]
+                                additional_id_raw = additional_id.to_bytes(1, 'big')
+                                id_size = 1
+                                length_size = 1
+                                current_byte += 2
+                            else:
+                                print(f"    [AVISO] Datos insuficientes para leer el siguiente ID/Longitud. Posición: {current_byte}. Rompiendo ciclo.")
+                                break
+
+                            start_value = current_byte
                             end_value = start_value + additional_length
                             
                             # Asegurar que el valor no excede el cuerpo del mensaje
-                            if end_value > len(message_body): break
+                            if end_value > len(message_body): 
+                                print(f"    [ERROR] Longitud de valor ({additional_length}) para ID {hex(additional_id)} excede el cuerpo. Fin esperado: {end_value}. Real: {len(message_body)}. Rompiendo ciclo.")
+                                break
                             
                             additional_value = message_body[start_value:end_value]
                             
-                            print(f"  - ID Adicional: {hex(additional_id)} | Longitud: {additional_length} bytes")
+                            print(f"  - ID Adicional (RAW): {additional_id_raw.hex()} | ID: {hex(additional_id)} | Longitud de Valor: {additional_length} bytes")
                             
-                            if additional_id == 0x33: # Modo de Dispositivo
+                            # --- Decodificación Específica por ID ---
+                            
+                            if additional_id == 0x01: # Kilometraje (DWORD)
+                                mileage_m = int.from_bytes(additional_value, 'big')
+                                mileage_km = mileage_m / 10.0
+                                print(f"    -> Kilometraje (0x01): **{mileage_km:.1f} km** (RAW: {mileage_m / 100:.2f} m)")
+                            
+                            elif additional_id == 0x30: # Fuerza de señal inalámbrica (BYTE)
+                                signal_strength = int.from_bytes(additional_value, 'big')
+                                print(f"    -> Fuerza de señal inalámbrica (0x30): **{signal_strength}** (Nivel de señal)")
+
+                            elif additional_id == 0x31: # Conteo de Satélites (BYTE)
+                                satellite_count = int.from_bytes(additional_value, 'big')
+                                print(f"    -> Satélites (GSNN) (0x31): **{satellite_count}**")
+
+                            elif additional_id == 0x32: # Duración del Ejercicio/Movimiento (WORD)
+                                if additional_length == 2:
+                                    duration_s = int.from_bytes(additional_value, 'big')
+                                    print(f"    -> Duración de Movimiento (0x32): **{duration_s} segundos**")
+                                else:
+                                    print(f"    -> Duración de Movimiento (0x32): Valor RAW: {additional_value.hex()} (Longitud inesperada)")
+
+                            elif additional_id == 0x33: # Modo de Dispositivo (BYTE)
                                 device_mode_int = int.from_bytes(additional_value, 'big')
                                 mode_desc = MODE_MAP.get(device_mode_int, "Modo Desconocido")
                                 print(f"    -> Modo de Trabajo (0x33): **{mode_desc}** (Valor RAW: {device_mode_int})")
-                            
-                            elif additional_id == 0x30: # Fuerza de señal inalámbrica
-                                signal_strength = int.from_bytes(additional_value, 'big')
-                                print(f"    -> Fuerza de señal inalámbrica (0x30): {signal_strength}")
 
-                            elif additional_id == 0xeb:
-                                # Decodificación de la trama extendida propietaria
-                                parse_extended_eb_fields(additional_value)
+                            elif additional_id == 0x00B2: # ICCID (20 bytes BCD)
+                                # L=10 (Longitud de valor = 16)
+                                try:
+                                    iccid = additional_value.hex()
+                                    # La documentación del proveedor indica 20 bytes BCD.
+                                    # El ejemplo muestra una cadena ASCII/Hex de 20 caracteres (10 bytes).
+                                    # Usamos .hex() para mostrar el valor crudo, que parece ser el ICCID
+                                    print(f"    -> ICCID (0x00B2): **{iccid}**")
+                                except Exception:
+                                     print(f"    -> ICCID (0x00B2): Valor RAW: {additional_value.hex()}")
+
+                            elif additional_id == 0x0089: # Estado Propietario Extendido (DWORD)
+                                if additional_length == 4:
+                                    status_prop_ext_int = int.from_bytes(additional_value, 'big')
+                                    
+                                    sleep_status = "Dormido" if (status_prop_ext_int & 0b1) == 1 else "Activo"
+                                    lift_status = "**LEVANTADO (Alarma)**" if (status_prop_ext_int >> 6) & 0b1 else "Normal (No Levantado)"
+                                    
+                                    print(f"    -> **Estado Propietario Extendido (0x0089)** (RAW): {hex(status_prop_ext_int)}")
+                                    print(f"      > Estado de Suspensión (Bit 0): {sleep_status}")
+                                    print(f"      > Estado de Levantamiento (Bit 6): {lift_status}")
+                                else:
+                                    print(f"    -> **Estado Propietario Extendido (0x0089)**: Longitud inesperada de {additional_length} bytes.")
+
+                            elif additional_id == 0x00C5: # Estado de Alarma Extendido (DWORD)
+                                if additional_length == 4:
+                                    status_ext_int = int.from_bytes(additional_value, 'big')
+                                    
+                                    # Bits 3 y 4: Estado de Posicionamiento Propietario
+                                    pos_bits = (status_ext_int >> 3) & 0b11
+                                    if pos_bits == 0b10: pos_status = "Posicionamiento GPS"
+                                    elif pos_bits == 0b01: pos_status = "Posicionamiento Wi-Fi"
+                                    elif pos_bits == 0b11: pos_status = "Posicionamiento GPS y Wi-Fi"
+                                    else: pos_status = "Sin Posicionamiento"
+
+                                    # Bit 6: Alarma de Vibración (1: Normal, 0: Alarma)
+                                    vibration_bit = (status_ext_int >> 6) & 0b1
+                                    vibration_status = "Normal (No Vibración)" if vibration_bit == 1 else "**ALARMA DE VIBRACIÓN**"
+                                    
+                                    print(f"    -> **Estado de Alarma Extendido (0x00C5)** (RAW): {hex(status_ext_int)}")
+                                    print(f"      > Posicionamiento Adicional (Bits 3-4): {pos_status}")
+                                    print(f"      > Estado de Vibración (Bit 6): {vibration_status}")
+                                else:
+                                    print(f"    -> **Estado de Alarma Extendido (0x00C5)**: Longitud inesperada de {additional_length} bytes.")
+
+                            elif additional_id == 0x002D: # Voltaje del Dispositivo (WORD)
+                                # L=2 (Longitud de valor=2). El valor es en mV (milivoltios).
+                                if additional_length == 2:
+                                    voltage_mv = int.from_bytes(additional_value, 'big') 
+                                    voltage_v = voltage_mv / 1000.0
+                                    print(f"    -> **Voltaje (0x002D)**: **{voltage_v:.3f} V** (RAW: {voltage_mv} mV)")
+                                else:
+                                      print(f"    -> **Voltaje (0x002D)**: Longitud inesperada de {additional_length} bytes.")
+
+                            elif additional_id == 0x00A8: # Porcentaje de Batería (BYTE)
+                                # L=1 (Longitud de Valor=1).
+                                if additional_length == 1:
+                                    percentage = additional_value[0]
+                                    print(f"    -> **Porcentaje de Batería (0x00A8)**: **{percentage} %**")
+                                else:
+                                      print(f"    -> **Porcentaje de Batería (0x00A8)**: Longitud inesperada de {additional_length} bytes.")
+
+                            elif additional_id == 0x00D5: # IMEI (15 bytes BCD)
+                                # L=15 (Longitud de Valor=15).
+                                if additional_length >= 15:
+                                    try:
+                                        # El IMEI se decodifica como ASCII (o BCD, pero el ejemplo sugiere ASCII legible)
+                                        imei = additional_value[:15].decode('ascii', errors='ignore').strip('\x00')
+                                        print(f"    -> **IMEI del Dispositivo (0x00D5)**: {imei}")
+                                    except UnicodeDecodeError:
+                                        print(f"    -> [ERROR] IMEI (No se pudo decodificar): {additional_value.hex()}")
+
+                            elif additional_id == 0x00B9: # Wi-Fi
+                                # L=variable. Contiene: Conteo(1) + Lista de (MAC, RSSI separados por coma)
+                                if additional_value:
+                                    try:
+                                        count = additional_value[0]
+                                        wifi_data_bytes = additional_value[1:]
+                                        
+                                        # Decodificación de la cadena MAC,RSSI
+                                        wifi_data_string = wifi_data_bytes.decode('ascii', errors='ignore').strip('\x00').strip()
+                                        wifi_entries = [e for e in wifi_data_string.split(',') if e]
+                                        
+                                        print(f"    -> **Redes Wi-Fi Encontradas (0x00B9)** (Contador: {count}, Pares: {len(wifi_entries)//2}):")
+                                        for i in range(0, len(wifi_entries), 2):
+                                            if i + 1 < len(wifi_entries):
+                                                mac = wifi_entries[i]
+                                                rssi = wifi_entries[i+1]
+                                                print(f"      > MAC: {mac}, RSSI (dBm): {rssi}")
+                                    except Exception as e:
+                                        print(f"    -> [ERROR] Error de decodificación de datos Wi-Fi: {e}")
+                                else:
+                                      print("    -> **Redes Wi-Fi Encontradas (0x00B9)**: Datos de Wi-Fi vacíos.")
                             
+                            elif additional_id == 0xeb:
+                                # Ya no tratamos EB aquí, ya que desglosamos los IDs propietarios.
+                                print(f"    -> ID {hex(additional_id)} (NO USADO - El ID 0xeb fue desglosado): {additional_value.hex()}")
+
                             else:
                                 print(f"    -> ID {hex(additional_id)} (No Mapeado): {additional_value.hex()}")
                             
-                            current_byte = end_value # Avanzar al inicio del siguiente campo ID(1)-L(1)-Valor
+                            current_byte = end_value # Avanzar al inicio del siguiente campo ID-L-Valor
+                        
+                    print("  --- FIN DE INFORMACIÓN ADICIONAL ---")
                 
                 # Respuesta general de la plataforma (0x8001) para el reporte de posición
                 response_message_id = 0x8001
