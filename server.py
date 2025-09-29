@@ -147,7 +147,9 @@ def decode_battery_level(value):
 def decode_imei(value):
     """Decodifica el IMEI (ID 0x00D5)."""
     try:
-        return value[:15].decode('ascii', errors='ignore').strip('\x00')
+        # FIX: Mover la lógica de strip fuera de la f-string
+        decoded_imei = value[:15].decode('ascii', errors='ignore').strip('\x00')
+        return f"**{decoded_imei}**"
     except Exception:
         return f"ERROR (RAW: {value.hex()})"
 
@@ -157,6 +159,7 @@ def decode_wifi_data(value):
     
     try:
         count = value[0]
+        # FIX: Mover la lógica de strip fuera de la f-string
         wifi_data_string = value[1:].decode('ascii', errors='ignore').strip('\x00').strip()
         
         # El patrón es MAC,RSSI,MAC,RSSI,... 
@@ -276,15 +279,24 @@ def parse_query_parameters_response(message_body):
             desc = "Low Voltage Threshold"
         elif param_id == 0x0010: 
             desc = "APN (Access Point Name)"
-            try: display_value = f"**{param_value_raw.decode('ascii', errors='ignore').strip('\x00')}**"
+            try: 
+                # FIX: Mover el strip fuera de la f-string
+                decoded_string = param_value_raw.decode('ascii', errors='ignore').strip('\x00')
+                display_value = f"**{decoded_string}**"
             except: pass
         elif param_id == 0x0013: 
             desc = "Dirección de Servidor Principal"
-            try: display_value = f"**{param_value_raw.decode('ascii', errors='ignore').strip('\x00')}**"
+            try: 
+                # FIX: Mover el strip fuera de la f-string
+                decoded_string = param_value_raw.decode('ascii', errors='ignore').strip('\x00')
+                display_value = f"**{decoded_string}**"
             except: pass
         elif param_id == 0x0011 or param_id == 0x0012: 
             desc = "Usuario/Contraseña APN"
-            try: display_value = f"**{param_value_raw.decode('ascii', errors='ignore').strip('\x00')}**"
+            try: 
+                # FIX: Mover el strip fuera de la f-string
+                decoded_string = param_value_raw.decode('ascii', errors='ignore').strip('\x00')
+                display_value = f"**{decoded_string}**"
             except: pass
         elif param_id == 0x0083 and param_length == 8:
             desc = "ID Propietario (d4c14238...)"
@@ -460,16 +472,17 @@ def handle_client(conn, addr):
                 current_serial = last_terminal_serial
                 
                 for command_name in commands_to_send:
+                    # Usamos el serial actual para el paquete, y luego lo incrementamos para el siguiente.
+                    # Esto evita usar el serial del paquete entrante si se envía más de un comando.
+                    current_serial = (current_serial + 1) % 65536
+                    
                     if command_name == 'SET_PARAMS':
-                        packet, serial_raw, raw_hex, id = build_set_parameters_command(terminal_phone_number_raw, current_serial)
+                        packet, serial_raw, raw_hex, id = build_set_parameters_command(terminal_phone_number_raw, current_serial - 1)
                         conn.sendall(packet)
-                        # Usamos el serial del comando como base para el siguiente comando/paquete
-                        current_serial = int.from_bytes(serial_raw, 'big')
                         
                     elif command_name == 'QUERY_PARAMS':
-                        packet, serial_raw, raw_hex, id = build_query_parameters_command(terminal_phone_number_raw, current_serial)
+                        packet, serial_raw, raw_hex, id = build_query_parameters_command(terminal_phone_number_raw, current_serial - 1)
                         conn.sendall(packet)
-                        current_serial = int.from_bytes(serial_raw, 'big')
 
                 # FIX CRÍTICO: Limpiar la lista para evitar el bucle infinito de comandos
                 commands_to_send = []
