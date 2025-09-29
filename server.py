@@ -17,12 +17,6 @@ MODE_MAP = {
     0x01: "Modo de Ultra-larga duración (Ahorro de energía)",
 }
 
-# Mapeo para el Estado de Carga (dentro de 0x00C5 en 0xEB, bit 2)
-CHARGING_STATUS_MAP = {
-    0: "No Cargando (Descargando o Batería)",
-    1: "Cargando (Conectado a fuente de alimentación)",
-}
-
 # --- Función para Des-escapar Bytes JT/T 808 ---
 def unescape_jt808(data_bytes_with_delimiters):
     """
@@ -90,28 +84,30 @@ def parse_extended_eb_fields(additional_value):
     """
     Analiza la sub-trama extendida (ID 0xeb) utilizando la estructura Longitud (2) + ID (2) + Valor (N).
     
-    FIX: El primer campo (000c00b2) parece ser una cabecera propietaria. 
-    Ajustamos el inicio de la lectura para corregir el desplazamiento.
+    FIX: El dispositivo tiene un bloque de metadatos propietarios al inicio que debe ser ignorado 
+    para que la decodificación de los campos estándar (Len + ID + Value) funcione.
     """
     sub_data = additional_value
     
-    # INICIO DE LECTURA: El log anterior mostró que el error ocurría en la posición 3. 
-    # Intentaremos empezar desde la posición 3, o ajustaremos el patrón si es necesario.
-    # El patrón esperado es: Len (2 bytes) + ID (2 bytes) + Value (N bytes)
-    sub_current_byte = 0
+    # Basado en el log: ...ebae000c00b28951064012473110652f (15 bytes de ruido)
+    # El primer bloque que parece seguir el patrón es 00060089ffffffff
+    # 000c00b28951064012473110652f -> 15 bytes a saltar (0 a 14)
+    # El primer patrón válido inicia en el byte 15.
+    
+    initial_offset = 15
+    sub_current_byte = initial_offset
     
     print("    - INICIO DE DECODIFICACIÓN DETALLADA DE 0xEB (Información Extendida Propietaria):")
     
-    # Si el primer bloque es fijo (como el 000c00b2) lo saltamos para ir al inicio de los datos variables.
-    # Basado en el log: ...ebae000c00b28951...
-    # Intentaremos saltar 5 bytes (000c00b2) y ver si el 0x89 es un ID de 2 bytes, o si 00b2 es el primer Len+ID.
+    # Imprimimos la data que estamos saltando (solo por depuración)
+    print(f"      [DEBUG] Saltando {initial_offset} bytes de encabezado propietario: {sub_data[0:initial_offset].hex()}")
 
-    # Intentaremos saltar los 3 bytes iniciales ('000c00') que parecen ser metadatos fijos.
-    if len(sub_data) >= 3 and sub_data[0:3] == b'\x00\x0c\x00':
-        sub_current_byte = 3
-        print("      [DEBUG] Saltando cabecera propietaria inicial (3 bytes: 000c00).")
-    
+    if sub_current_byte >= len(sub_data):
+        print("      [AVISO] No hay datos restantes después de saltar el encabezado.")
+        return
+
     while sub_current_byte < len(sub_data):
+        
         # 1. Leer Longitud del Bloque (2 bytes, incluye los 2 bytes del ID)
         if sub_current_byte + 2 > len(sub_data): 
             print(f"      [AVISO] Datos insuficientes para leer la longitud del bloque. Posición: {sub_current_byte}")
@@ -184,6 +180,9 @@ def parse_extended_eb_fields(additional_value):
                 # El valor debe ser decodificado como ASCII, ya que contiene los caracteres ':', ',', '-'
                 wifi_data_string = sub_value_bytes.decode('ascii')
                 wifi_entries = wifi_data_string.split(',')
+                
+                # El campo 0x0070 antes de 0x00B9 es la longitud de 0x00B9.
+                # El log muestra que 0x0070 (112 decimal) bytes contienen la información Wi-Fi.
                 print(f"        -> **Redes Wi-Fi Encontradas (0x00B9)** ({len(wifi_entries)//2} pares MAC, RSSI):")
                 for i in range(0, len(wifi_entries), 2):
                     if i + 1 < len(wifi_entries):
@@ -193,13 +192,11 @@ def parse_extended_eb_fields(additional_value):
             except (UnicodeDecodeError, IndexError) as e:
                 print(f"        -> [ERROR] Error de decodificación de datos Wi-Fi: {e}")
         
-        elif sub_id == 0x00B2: # ICCID (20 bytes BCD - 10 bytes según la trama anterior)
-            iccid = sub_value_bytes.hex()
-            print(f"        -> **ICCID de la SIM (0x00B2)**: {iccid}")
-        
         elif sub_id == 0x0089:
-            # Estado extendido propietario (1 byte)
             print(f"        -> **Estado Propietario Extendido (0x0089)**: {sub_value_bytes.hex()}")
+
+        elif sub_id == 0x00B2: 
+            print(f"        -> **ICCID de la SIM (0x00B2)**: {sub_value_bytes.hex()}")
 
         else:
             print(f"        -> ID {hex(sub_id)} (No Mapeado): {sub_value_bytes.hex()}")
@@ -279,13 +276,11 @@ def handle_client(conn, addr):
             if message_id == 0x0100: 
                 print("  --> Tipo de Mensaje: REGISTRO DE TERMINAL (0x0100) - INICIANDO LOGIN")
                 
-                # 0x0100: Provincia (2) + Ciudad (2) + Fabricante (5 GBK) + Modelo (20 GBK) + ID Terminal (7 BCD)
-                
                 # ID de Terminal (7 bytes BCD)
                 terminal_id_raw = message_body[29:36]
                 terminal_id_str = terminal_id_raw.hex()
 
-                # FIX: Usamos GB18030
+                # FIX: Usamos GB18030 para codificación de texto
                 try:
                     manufacturer_id = message_body[4:9].decode('gb18030').strip('\x00').strip()
                     model_terminal = message_body[9:29].decode('gb18030').strip('\x00').strip()
@@ -314,7 +309,6 @@ def handle_client(conn, addr):
             elif message_id == 0x0200: 
                 print("  --> Tipo de Mensaje: REPORTE DE POSICIÓN (0x0200) - DECODIFICANDO DATOS")
                 
-                # 0x0200: Alarma (4) + Estado (4) + Latitud (4) + Longitud (4) + Altitud (2) + Velocidad (2) + Dirección (2) + Hora (6) + Info Adicional (N)
                 if len(message_body) < 28:
                     response_result = 0x01
                     print("    [ERROR] Cuerpo de posición demasiado corto.")
@@ -445,4 +439,3 @@ def start_server():
 # --- Punto de Entrada del Programa ---
 if __name__ == "__main__":
     start_server()
-
