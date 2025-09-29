@@ -114,6 +114,7 @@ def decode_extended_status(value):
         status_int = int.from_bytes(value, 'big')
         sleep_status = "Dormido" if (status_int & 0b1) == 1 else "Activo"
         lift_status = "**LEVANTADO (Alarma)**" if (status_int >> 6) & 0b1 else "Normal (No Levantado)"
+        # La trama del usuario tiene 0xFFFFFFFF para este campo en el ejemplo
         return f"(RAW: {hex(status_int)}) | Suspensión: {sleep_status} | Levantamiento: {lift_status}"
     return f"Longitud inesperada de {len(value)} bytes."
 
@@ -127,6 +128,7 @@ def decode_extended_alarm(value):
         vibration_bit = (status_ext_int >> 6) & 0b1
         vibration_status = "Normal" if vibration_bit == 1 else "**ALARMA DE VIBRACIÓN**"
         
+        # La trama del usuario tiene 0xFFFFFFF7 para este campo en el ejemplo
         return f"(RAW: {hex(status_ext_int)}) | Posicionamiento: {pos_status} | Vibración: {vibration_status}"
     return f"Longitud inesperada de {len(value)} bytes."
 
@@ -146,6 +148,7 @@ def decode_battery_level(value):
 def decode_imei(value):
     """Decodifica el IMEI (ID 0x00D5)."""
     try:
+        # Los IMEI son típicamente de 15 dígitos. La trama puede tener un byte de terminación (0x00)
         return value[:15].decode('ascii', errors='ignore').strip('\x00')
     except Exception:
         return f"ERROR (RAW: {value.hex()})"
@@ -156,15 +159,17 @@ def decode_wifi_data(value):
     
     try:
         count = value[0]
+        # La información de Wi-Fi se envía como cadena ASCII
         wifi_data_string = value[1:].decode('ascii', errors='ignore').strip('\x00').strip()
         
-        # El patrón es MAC,RSSI,MAC,RSSI,... (se asume que la decodificación ASCII lo deja separado por comas)
+        # El patrón es MAC,RSSI,MAC,RSSI,... 
         wifi_entries = [e for e in wifi_data_string.split(',') if e]
-        output = [f"Contador: {count}"]
+        output = [f"Contador de redes Wi-Fi: {count}"]
         
         for i in range(0, len(wifi_entries), 2):
             if i + 1 < len(wifi_entries):
                 mac = wifi_entries[i]
+                # Se asume que RSSI viene como cadena con signo
                 rssi = wifi_entries[i+1]
                 output.append(f"  > MAC: {mac}, RSSI (dBm): {rssi}")
         
@@ -172,13 +177,22 @@ def decode_wifi_data(value):
     except Exception as e:
         return f"[ERROR] Fallo en decodificación Wi-Fi: {e}"
 
+def decode_unknown_placeholder(value):
+    """Función de marcador de posición para IDs no documentados (como 0x000C)."""
+    return f"Valor binario (Longitud: {len(value)}): {value.hex()}"
+
+
 # Diccionario de mapeo de IDs de Información Adicional a funciones de decodificación
 ADDITIONAL_INFO_DECODERS = {
+    # Estándar JT/T 808 (1 byte ID)
     0x01: ("Kilometraje", decode_mileage),
     0x30: ("Fuerza de Señal", decode_signal_strength),
     0x31: ("Conteo de Satélites", decode_satellite_count),
     0x32: ("Duración de Movimiento", decode_movement_duration),
     0x33: ("Modo de Dispositivo", decode_device_mode),
+    
+    # Propietario (2 bytes ID: 0x00XX)
+    0x000C: ("Placeholder Desconocido (0x000C)", decode_unknown_placeholder), # Añadido para consumir bytes
     0x00B2: ("ICCID", decode_iccid),
     0x0089: ("Estado Propietario Extendido", decode_extended_status),
     0x00C5: ("Estado de Alarma Extendido", decode_extended_alarm),
@@ -186,25 +200,29 @@ ADDITIONAL_INFO_DECODERS = {
     0x00A8: ("Porcentaje de Batería", decode_battery_level),
     0x00D5: ("IMEI", decode_imei),
     0x00B9: ("Redes Wi-Fi Encontradas", decode_wifi_data),
-    # 0x00D5 es de 2 bytes, 0x30 es de 1 byte.
 }
 
-# --- Funciones de Comandos y Respuestas (Mantenidas por necesidad) ---
-# ... (build_set_parameters_command, build_query_parameters_command, parse_query_parameters_response se mantienen)
+# --- Funciones de Comandos y Respuestas ---
+
 def build_set_parameters_command(phone_number_raw, current_serial_number):
     """Construye un comando 0x8103 (Establecer Parámetros)."""
     COMMAND_ID = 0x8103
-    param_id_27, param_len_27, param_value_27 = 0x0027, 0x04, 60
-    param_id_45, param_len_45, param_value_45 = 0x0045, 0x04, struct.pack('>f', 3.5)
+    
+    # Parámetros de ejemplo: Intervalo de subida (0x0027) y Umbral de bajo voltaje (0x0045)
+    param_id_27, param_len_27, param_value_27 = 0x0027, 0x04, 60 # 60 segundos
+    param_id_45, param_len_45, param_value_45 = 0x0045, 0x04, struct.pack('>f', 3.5) # 3.5 V
     
     body_payload = b'\x02' # Conteo de Parámetros (N=2)
+    # Parámetro 1: Intervalo de subida
     body_payload += param_id_27.to_bytes(4, 'big') + param_len_27.to_bytes(1, 'big') + param_value_27.to_bytes(4, 'big')
+    # Parámetro 2: Umbral de bajo voltaje
     body_payload += param_id_45.to_bytes(4, 'big') + param_len_45.to_bytes(1, 'big') + param_value_45
     
     command_serial_raw = ((current_serial_number + 1) % 65536).to_bytes(2, 'big')
     print("\n    -> [COMANDO] Preparando comando de Establecer Parámetros (0x8103)...")
     
     final_packet, raw_frame_hex = create_jt808_packet(COMMAND_ID, phone_number_raw, command_serial_raw, body_payload)
+    print(f"    -> [COMANDO 0x8103] RAW: {raw_frame_hex}")
     return final_packet, command_serial_raw, raw_frame_hex, COMMAND_ID
 
 def build_query_parameters_command(phone_number_raw, current_serial_number):
@@ -220,6 +238,7 @@ def build_query_parameters_command(phone_number_raw, current_serial_number):
     print("\n    -> [COMANDO] Preparando comando de Consulta de Parámetros (0x8104)...")
 
     final_packet, raw_frame_hex = create_jt808_packet(COMMAND_ID, phone_number_raw, command_serial_raw, body_payload)
+    print(f"    -> [COMANDO 0x8104] RAW: {raw_frame_hex}")
     return final_packet, command_serial_raw, raw_frame_hex, COMMAND_ID
 
 def parse_query_parameters_response(message_body):
@@ -246,10 +265,11 @@ def parse_query_parameters_response(message_body):
         param_value_raw = message_body[value_start:value_end]
         display_value = param_value_raw.hex()
         
+        # Intentar decodificación legible para parámetros conocidos
         if param_id == 0x0027 and param_length == 4:
-            display_value = f"**{int.from_bytes(param_value_raw, 'big')} segundos**"
+            display_value = f"**{int.from_bytes(param_value_raw, 'big')} segundos** (Intervalo de subida)"
         elif param_id == 0x0045 and param_length == 4:
-            display_value = f"**{struct.unpack('>f', param_value_raw)[0]:.2f} V**"
+            display_value = f"**{struct.unpack('>f', param_value_raw)[0]:.2f} V** (Umbral de bajo voltaje)"
         
         print(f"    - Parámetro {i+1} | ID: {hex(param_id)} | Longitud: {param_length} | Valor: {display_value}")
         current_byte = value_end
@@ -257,44 +277,64 @@ def parse_query_parameters_response(message_body):
 # --- Lógica Principal de Decodificación de Posición (0x0200) ---
 
 def parse_additional_info(message_body, additional_info_start):
-    """Extrae y decodifica la información adicional del cuerpo 0x0200."""
+    """Extrae y decodifica la información adicional del cuerpo 0x0200,
+    manejando IDs de 1 y 2 bytes según la especificación JT/T 808 extendida."""
     current_byte = additional_info_start
     output = []
     
     while current_byte < len(message_body):
-        # Determinar si el ID es de 1 o 2 bytes
+        
+        additional_id = None
+        additional_length = None
+        header_size = 0
+
+        # --- Intento 1: ID de 2 bytes (JT/T 808 Extended: 0x00XX) ---
+        # Si el primer byte es 0x00, asumimos un ID de 2 bytes (0x00XX) seguido de 1 byte de longitud.
+        # Esto cubre los IDs propietarios como 0x00B2, 0x0089, etc., y el 0x000C no mapeado.
         if current_byte + 3 <= len(message_body) and message_body[current_byte] == 0x00:
-            # ID de 2 bytes (Propietario): ID(2) + Longitud(1)
-            additional_id_raw = message_body[current_byte:current_byte+2]
-            additional_id = int.from_bytes(additional_id_raw, 'big')
+            additional_id = int.from_bytes(message_body[current_byte:current_byte+2], 'big')
             additional_length = message_body[current_byte+2]
-            current_byte += 3
+            header_size = 3 # ID(2) + Length(1)
+        
+        # --- Intento 2: ID de 1 byte (JT/T 808 Standard) ---
+        # Si no, asumimos un ID de 1 byte (0xXX) seguido de 1 byte de longitud.
         elif current_byte + 2 <= len(message_body):
-            # ID de 1 byte (Estándar/Corto): ID(1) + Longitud(1)
             additional_id = message_body[current_byte]
-            additional_id_raw = additional_id.to_bytes(1, 'big')
             additional_length = message_body[current_byte+1]
-            current_byte += 2
+            header_size = 2 # ID(1) + Length(1)
+        
+        # --- Datos insuficientes ---
         else:
             output.append(f"    [AVISO] Datos insuficientes para leer el siguiente ID/Longitud. Posición: {current_byte}.")
             break
 
-        start_value, end_value = current_byte, current_byte + additional_length
-        if end_value > len(message_body): 
-            output.append(f"    [ERROR] Longitud de valor ({additional_length}) para ID {hex(additional_id)} excede el cuerpo. Rompiendo ciclo.")
-            break
-        
-        additional_value = message_body[start_value:end_value]
-        current_byte = end_value # Avanzar al siguiente campo
+        # Proceso de decodificación
+        if additional_id is not None:
+            
+            # Ajustamos el puntero para saltar el encabezado
+            current_byte += header_size
+            
+            start_value, end_value = current_byte, current_byte + additional_length
+            
+            if end_value > len(message_body): 
+                output.append(f"    [ERROR] Longitud de valor ({additional_length}) para ID {hex(additional_id)} excede el cuerpo. Rompiendo ciclo.")
+                break
+            
+            additional_value = message_body[start_value:end_value]
+            current_byte = end_value # Avanzar al siguiente campo
 
-        # Búsqueda y ejecución de decodificador en el diccionario
-        decoder_tuple = ADDITIONAL_INFO_DECODERS.get(additional_id)
-        if decoder_tuple:
-            desc, decoder_func = decoder_tuple
-            decoded_value = decoder_func(additional_value)
-            output.append(f"  - ID {hex(additional_id)} ({desc}): {decoded_value}")
+            # Búsqueda y ejecución de decodificador en el diccionario
+            decoder_tuple = ADDITIONAL_INFO_DECODERS.get(additional_id)
+            if decoder_tuple:
+                desc, decoder_func = decoder_tuple
+                decoded_value = decoder_func(additional_value)
+                output.append(f"  - ID {hex(additional_id)} ({desc}): {decoded_value}")
+            else:
+                output.append(f"  - ID {hex(additional_id)} (No Mapeado): RAW: {additional_value.hex()}")
         else:
-            output.append(f"  - ID {hex(additional_id)} (No Mapeado): RAW: {additional_value.hex()}")
+            output.append(f"    [ERROR] No se pudo determinar el ID/Longitud en la posición {current_byte}. Deteniendo el parsing.")
+            break
+
 
     return "\n".join(output)
 
@@ -311,9 +351,8 @@ def handle_client(conn, addr):
             data = conn.recv(1024)
             if not data: break
             
+            # 1. Des-escape y Validación
             processed_data = unescape_jt808(data)
-            
-            # (Validación de Checksum y Parseo de Cabecera)
             checksum_received = processed_data[-1]
             payload_for_checksum = processed_data[:-1]
             
@@ -321,9 +360,10 @@ def handle_client(conn, addr):
             for byte in payload_for_checksum: calculated_checksum ^= byte
             
             if calculated_checksum != checksum_received:
-                print(f"  [ERROR] Checksum INCORRECTO. Descartando mensaje.")
+                print(f"  [ERROR] Checksum INCORRECTO ({checksum_received} != {calculated_checksum}). Descartando mensaje.")
                 continue
 
+            # 2. Parseo de Cabecera
             message_id = int.from_bytes(payload_for_checksum[0:2], 'big')
             body_length = int.from_bytes(payload_for_checksum[2:4], 'big') & 0x03FF
             terminal_phone_number_raw = payload_for_checksum[4:10] 
@@ -335,22 +375,24 @@ def handle_client(conn, addr):
             
             print(f"\n[DATOS RECIBIDOS de {addr}] (ID: {hex(message_id)}, Serial: {message_serial_number})")
 
-            # --- Lógica de Respuesta/Comando Concisa ---
+            # 3. Lógica de Respuesta/Comando
             response_message_id, response_result, response_body = None, 0x00, b''
 
             if message_id == 0x0100: # REGISTRO
                 response_message_id = 0x8100 
                 response_body = message_serial_number_raw + response_result.to_bytes(1, 'big') + b"AUTH_CODE_BSJ_2025"
+                # Activamos comandos al registrarse
                 commands_to_send = ['SET_PARAMS', 'QUERY_PARAMS']
             
             elif message_id == 0x0102: # AUTENTICACIÓN
                 response_message_id = 0x8001
                 response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
+                # Activamos comandos al autenticarse
                 commands_to_send = ['SET_PARAMS', 'QUERY_PARAMS']
 
-            elif message_id == 0x0200: # REPORTE DE POSICIÓN (Lógica compleja encapsulada)
+            elif message_id == 0x0200: # REPORTE DE POSICIÓN
                 
-                # 1. Información Básica
+                # ... (Información Básica)
                 status_data = parse_status_bits(message_body[4:8])
                 latitude = int.from_bytes(message_body[8:12], 'big') / 1_000_000.0
                 longitude = int.from_bytes(message_body[12:16], 'big') / 1_000_000.0
@@ -358,11 +400,11 @@ def handle_client(conn, addr):
                 time_str = f"20{time_raw[0]:02x}-{time_raw[1]:02x}-{time_raw[2]:02x} {time_raw[3]:02x}:{time_raw[4]:02x}:{time_raw[5]:02x} (UTC+8)"
 
                 print("  --- INFORMACIÓN DE POSICIÓN BÁSICA (0x0200) ---")
-                print(f"  - Lat/Lon: {latitude:.6f} ({status_data['Tipo Latitud']}) / {longitude:.6f} ({status_data['Tipo Longitud']})")
+                print(f"  - Lat/Lon: {latitude:.6f} ({status_data['Tipo Latitud']}) / {longitude:.6ff} ({status_data['Tipo Longitud']})")
                 print(f"  - Estado: {status_data['Estado Posición']} | ACC: {status_data['Estado ACC']}")
                 print(f"  - Hora del Reporte: {time_str}")
                 
-                # 2. Información Adicional (Llamada a la función de decodificación centralizada)
+                # Información Adicional (Corregido)
                 print("  --- INFORMACIÓN ADICIONAL DEL CUERPO ---")
                 print(parse_additional_info(message_body, 28))
                 print("  --- FIN DE INFORMACIÓN ADICIONAL ---")
@@ -374,16 +416,28 @@ def handle_client(conn, addr):
                 parse_query_parameters_response(message_body)
                 response_message_id = None # No se envía ACK
 
-            # 3. Envío de Respuesta ACK
+            # 4. Envío de Respuesta ACK
             if response_message_id and terminal_phone_number_raw:
                 final_response, raw_frame_hex = create_jt808_packet(response_message_id, terminal_phone_number_raw, message_serial_number_raw, response_body)
                 conn.sendall(final_response)
-                # ... (Impresión de logs simplificada)
+                print(f"    <- [ACK {hex(response_message_id)}] Enviado respuesta a Serial {message_serial_number}.")
 
-            # 4. Envío de Comandos Pendientes
+            # 5. Envío de Comandos Pendientes
             if commands_to_send and terminal_phone_number_raw:
                 current_serial = last_terminal_serial
-                # ... (Lógica de envío de comandos 0x8103 y 0x8104)
+                
+                for command_name in commands_to_send:
+                    if command_name == 'SET_PARAMS':
+                        packet, serial_raw, raw_hex, id = build_set_parameters_command(terminal_phone_number_raw, current_serial)
+                        conn.sendall(packet)
+                        print(f"    -> [COMANDO {hex(id)}] Enviado comando de Establecer Parámetros. Serial: {int.from_bytes(serial_raw, 'big')}")
+                        current_serial = int.from_bytes(serial_raw, 'big')
+
+                    elif command_name == 'QUERY_PARAMS':
+                        packet, serial_raw, raw_hex, id = build_query_parameters_command(terminal_phone_number_raw, current_serial)
+                        conn.sendall(packet)
+                        print(f"    -> [COMANDO {hex(id)}] Enviado comando de Consulta de Parámetros. Serial: {int.from_bytes(serial_raw, 'big')}")
+                        current_serial = int.from_bytes(serial_raw, 'big')
 
     except socket.timeout:
         print(f"[TIMEOUT] Cliente {addr} inactivo.")
