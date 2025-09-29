@@ -15,7 +15,6 @@ TIMEOUT_IN_SECONDS = 30 * 60 # 30 minutos
 MODE_MAP = {
     0x00: "Modo Normal (Seguimiento Continuo)",
     0x01: "Modo de Ultra-larga duración (Ahorro de energía)",
-    # Basado en la documentación JT/T 808
 }
 
 # Mapeo para el Estado de Carga (dentro de 0x00C5 en 0xEB, bit 2)
@@ -90,31 +89,53 @@ def parse_status_bits(status_raw):
 def parse_extended_eb_fields(additional_value):
     """
     Analiza la sub-trama extendida (ID 0xeb) utilizando la estructura Longitud (2) + ID (2) + Valor (N).
+    
+    FIX: El primer campo (000c00b2) parece ser una cabecera propietaria. 
+    Ajustamos el inicio de la lectura para corregir el desplazamiento.
     """
     sub_data = additional_value
     
-    # Saltamos el encabezado inicial '000c00' (3 bytes) que parece ser un padding inicial o un identificador de bloque
-    sub_current_byte = 3 
+    # INICIO DE LECTURA: El log anterior mostró que el error ocurría en la posición 3. 
+    # Intentaremos empezar desde la posición 3, o ajustaremos el patrón si es necesario.
+    # El patrón esperado es: Len (2 bytes) + ID (2 bytes) + Value (N bytes)
+    sub_current_byte = 0
     
     print("    - INICIO DE DECODIFICACIÓN DETALLADA DE 0xEB (Información Extendida Propietaria):")
     
+    # Si el primer bloque es fijo (como el 000c00b2) lo saltamos para ir al inicio de los datos variables.
+    # Basado en el log: ...ebae000c00b28951...
+    # Intentaremos saltar 5 bytes (000c00b2) y ver si el 0x89 es un ID de 2 bytes, o si 00b2 es el primer Len+ID.
+
+    # Intentaremos saltar los 3 bytes iniciales ('000c00') que parecen ser metadatos fijos.
+    if len(sub_data) >= 3 and sub_data[0:3] == b'\x00\x0c\x00':
+        sub_current_byte = 3
+        print("      [DEBUG] Saltando cabecera propietaria inicial (3 bytes: 000c00).")
+    
     while sub_current_byte < len(sub_data):
         # 1. Leer Longitud del Bloque (2 bytes, incluye los 2 bytes del ID)
-        if sub_current_byte + 2 > len(sub_data): break
+        if sub_current_byte + 2 > len(sub_data): 
+            print(f"      [AVISO] Datos insuficientes para leer la longitud del bloque. Posición: {sub_current_byte}")
+            break
+            
         sub_length_block = int.from_bytes(sub_data[sub_current_byte:sub_current_byte+2], 'big')
-
+        
         # 2. Leer ID del Bloque (2 bytes)
         id_start = sub_current_byte + 2
-        if id_start + 2 > len(sub_data): break
+        if id_start + 2 > len(sub_data): 
+            print(f"      [AVISO] Datos insuficientes para leer el ID del bloque. Posición: {id_start}")
+            break
+            
         sub_id = int.from_bytes(sub_data[id_start:id_start+2], 'big')
         
         # 3. Calcular Longitud y Bytes del Valor
         value_start = id_start + 2
-        value_length = sub_length_block - 2 # Longitud del bloque - 2 bytes de ID
+        
+        # La longitud del valor es la longitud del bloque - 2 bytes de ID
+        value_length = sub_length_block - 2 
         value_end = value_start + value_length
 
         if value_end > len(sub_data):
-            print(f"      [ERROR] Longitud de valor inválida para el campo {hex(sub_id)}. Posición actual: {sub_current_byte}")
+            print(f"      [ERROR] Longitud de valor inválida ({value_length} bytes) para el campo {hex(sub_id)}. Posición actual: {sub_current_byte}. Fin esperado: {value_end}. Real: {len(sub_data)}")
             break
             
         sub_value_bytes = sub_data[value_start:value_end]
@@ -132,10 +153,9 @@ def parse_extended_eb_fields(additional_value):
                 percentage = sub_value_bytes[0]
                 print(f"        -> **Porcentaje de Batería (0x00A8)**: {percentage} %")
         
-        elif sub_id == 0x00D5: # Número IMEI (15 bytes)
+        elif sub_id == 0x00D5: # Número IMEI (15 bytes ASCII)
             if value_length == 15:
                 try:
-                    # El protocolo indica que es una conversión de HEX a String (ASCII)
                     imei = sub_value_bytes.decode('ascii')
                     print(f"        -> **IMEI del Dispositivo (0x00D5)**: {imei}")
                 except UnicodeDecodeError:
@@ -146,7 +166,6 @@ def parse_extended_eb_fields(additional_value):
                 status_ext_int = int.from_bytes(sub_value_bytes, 'big')
                 
                 # Bits 3 y 4: Estado de Posicionamiento Propietario (0x00C5)
-                # 00: Sin pos, 10: GPS, 01: WiFi, 11: GPS y WiFi (Según documentación)
                 pos_bits = (status_ext_int >> 3) & 0b11
                 if pos_bits == 0b10: pos_status = "Posicionamiento GPS"
                 elif pos_bits == 0b01: pos_status = "Posicionamiento Wi-Fi"
@@ -160,9 +179,9 @@ def parse_extended_eb_fields(additional_value):
                 print(f"        -> **Posicionamiento Adicional (Bits 3-4)**: {pos_status}")
                 print(f"        -> **Estado de Vibración (Bit 6)**: {vibration_status}")
 
-        elif sub_id == 0x00B9: # Información de Wi-Fi
+        elif sub_id == 0x00B9: # Información de Wi-Fi (Formato ASCII Mac,RSSI)
             try:
-                # Los datos de Wi-Fi suelen ser pares MAC,RSSI como texto ASCII
+                # El valor debe ser decodificado como ASCII, ya que contiene los caracteres ':', ',', '-'
                 wifi_data_string = sub_value_bytes.decode('ascii')
                 wifi_entries = wifi_data_string.split(',')
                 print(f"        -> **Redes Wi-Fi Encontradas (0x00B9)** ({len(wifi_entries)//2} pares MAC, RSSI):")
@@ -171,9 +190,17 @@ def parse_extended_eb_fields(additional_value):
                         mac = wifi_entries[i]
                         rssi = wifi_entries[i+1]
                         print(f"          > MAC: {mac}, RSSI (dBm): {rssi}")
-            except (UnicodeDecodeError, IndexError):
-                print(f"        -> [ERROR] Error de decodificación de datos Wi-Fi.")
+            except (UnicodeDecodeError, IndexError) as e:
+                print(f"        -> [ERROR] Error de decodificación de datos Wi-Fi: {e}")
         
+        elif sub_id == 0x00B2: # ICCID (20 bytes BCD - 10 bytes según la trama anterior)
+            iccid = sub_value_bytes.hex()
+            print(f"        -> **ICCID de la SIM (0x00B2)**: {iccid}")
+        
+        elif sub_id == 0x0089:
+            # Estado extendido propietario (1 byte)
+            print(f"        -> **Estado Propietario Extendido (0x0089)**: {sub_value_bytes.hex()}")
+
         else:
             print(f"        -> ID {hex(sub_id)} (No Mapeado): {sub_value_bytes.hex()}")
         
@@ -258,7 +285,7 @@ def handle_client(conn, addr):
                 terminal_id_raw = message_body[29:36]
                 terminal_id_str = terminal_id_raw.hex()
 
-                # FIX: Usamos GB18030 que es compatible con GBK y soporta los bytes 0xd4/0xc1
+                # FIX: Usamos GB18030
                 try:
                     manufacturer_id = message_body[4:9].decode('gb18030').strip('\x00').strip()
                     model_terminal = message_body[9:29].decode('gb18030').strip('\x00').strip()
@@ -267,25 +294,21 @@ def handle_client(conn, addr):
                     print(f"    - Modelo de Terminal (20 bytes GBK): {model_terminal}")
                     print(f"    - ID Terminal (7 bytes BCD): {terminal_id_str}")
 
-                    # 0x8100 (Respuesta de registro): Serial (2) + Resultado (1) + Código Autenticación (N)
+                    # 0x8100 (Respuesta de registro)
                     response_message_id = 0x8100 
                     auth_code = b"AUTH_CODE_BSJ_2025" 
                     response_body = message_serial_number_raw + response_result.to_bytes(1, 'big') + auth_code
                     print(f"    -> [RESPUESTA] Envío de Código de Autenticación: {auth_code.decode('latin-1')}")
                 
                 except Exception as e:
-                    print(f"    [ERROR GRAVE] Fallo al decodificar campos de texto del registro (Intento GB18030): {e}")
-                    # Si falla, respondemos con Fallo (0x01) para forzar un reintento limpio.
+                    print(f"    [ERROR GRAVE] Fallo al decodificar campos de texto del registro: {e}")
                     response_result = 0x01
                     response_message_id = 0x8100
                     response_body = message_serial_number_raw + response_result.to_bytes(1, 'big') + b''
                 
             elif message_id == 0x0102:
                 print("  --> Tipo de Mensaje: AUTENTICACIÓN DE TERMINAL (0x0102)")
-                # Respondemos con ACK general (0x8001) si la autenticación es exitosa
-                
                 response_message_id = 0x8001
-                # Cuerpo 0x8001: Serial (2) + ID Mensaje Recibido (2) + Resultado (1)
                 response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
 
             elif message_id == 0x0200: 
@@ -307,7 +330,6 @@ def handle_client(conn, addr):
                     latitude = latitude_raw / 1_000_000.0
                     longitude = longitude_raw / 1_000_000.0
                     
-                    # Formato de la hora: YYMMDDHHMMSS
                     try:
                         time_str = f"20{time_raw[0]:02x}-{time_raw[1]:02x}-{time_raw[2]:02x} {time_raw[3]:02x}:{time_raw[4]:02x}:{time_raw[5]:02x} (UTC+8)"
                     except IndexError:
@@ -365,7 +387,6 @@ def handle_client(conn, addr):
 
             elif message_id == 0x0003:
                 print("  --> Tipo de Mensaje: CIERRE DE SESIÓN (0x0003).")
-                # No se requiere respuesta específica, la conexión TCP se cerrará.
                 response_message_id = None
 
             else:
@@ -374,7 +395,6 @@ def handle_client(conn, addr):
             # 4. Construcción y Envío de la Respuesta
             if response_message_id:
                 response_body_len = len(response_body)
-                # Atributos: [Longitud (10 bits), Bits Reservados (6 bits)]
                 response_attributes = (response_body_len & 0x03FF).to_bytes(2, 'big')
                 
                 response_header = response_message_id.to_bytes(2, 'big') + \
@@ -388,7 +408,6 @@ def handle_client(conn, addr):
                     calculated_response_checksum ^= byte
                 
                 final_response_raw = checksum_response_payload + calculated_response_checksum.to_bytes(1, 'big')
-                # Escapar y delimitar la respuesta con 0x7e
                 final_response = b'\x7e' + final_response_raw + b'\x7e'
 
                 conn.sendall(final_response)
@@ -426,3 +445,4 @@ def start_server():
 # --- Punto de Entrada del Programa ---
 if __name__ == "__main__":
     start_server()
+
