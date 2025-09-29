@@ -163,12 +163,12 @@ def parse_status_bits(status_raw):
         "Valor RAW Completo": hex(status_int)
     }
 
-# --- Función para parsear sub-campos de la trama extendida 0xEB (Original) ---
+# --- Función para parsear sub-campos de la trama extendida 0xEB (CORREGIDA) ---
 def parse_extended_eb_fields(additional_value):
     """
-    Analiza la sub-trama extendida (ID 0xeb) utilizando la estructura Longitud (2) + ID (2) + Valor (N).
-    
-    NOTA: Se mantiene el offset propietario de 15 bytes.
+    Analiza la sub-trama extendida (ID 0xeb) utilizando la estructura L-ID-Valor.
+    CORRECCIÓN: Se usa Little-Endian para los campos de Longitud e ID (2 bytes cada uno) 
+    dentro de 0xEB, que son propietarios y no siguen el estándar Big-Endian.
     """
     sub_data = additional_value
     
@@ -187,32 +187,37 @@ def parse_extended_eb_fields(additional_value):
 
     while sub_current_byte < len(sub_data):
         
-        # 1. Leer Longitud del Bloque (2 bytes, incluye los 2 bytes del ID)
+        # 1. Leer Longitud del Bloque (2 bytes, Little Endian)
         if sub_current_byte + 2 > len(sub_data): 
             print(f"      [AVISO] Datos insuficientes para leer la longitud del bloque. Posición: {sub_current_byte}")
             break
             
-        # Longitud L: El dispositivo usa L+2 (Longitud del valor + 2 bytes del ID del bloque)
-        # Aquí se interpreta L como la longitud total del bloque (ID + Valor)
-        sub_length_block = int.from_bytes(sub_data[sub_current_byte:sub_current_byte+2], 'big')
+        # L: Longitud total del bloque (ID + Valor). LEÍDO COMO LITTLE-ENDIAN.
+        sub_length_block = int.from_bytes(sub_data[sub_current_byte:sub_current_byte+2], 'little')
         
-        # 2. Leer ID del Bloque (2 bytes)
+        # 2. Leer ID del Bloque (2 bytes, Little Endian)
         id_start = sub_current_byte + 2
         if id_start + 2 > len(sub_data): 
             print(f"      [AVISO] Datos insuficientes para leer el ID del bloque. Posición: {id_start}")
             break
             
-        sub_id = int.from_bytes(sub_data[id_start:id_start+2], 'big')
+        # T: ID del campo. LEÍDO COMO LITTLE-ENDIAN.
+        sub_id = int.from_bytes(sub_data[id_start:id_start+2], 'little')
         
         # 3. Calcular Longitud y Bytes del Valor
         value_start = id_start + 2
         
-        # La longitud del valor es la longitud del bloque - 2 bytes de ID
+        # La longitud del valor es la longitud del bloque (L) - 2 bytes de ID (T)
         value_length = sub_length_block - 2 
+        
+        if value_length < 0:
+             print(f"      [ERROR] Longitud de valor calculada negativa ({value_length}) para el campo {hex(sub_id)}. Rompiendo ciclo.")
+             break
+        
         value_end = value_start + value_length
 
         if value_end > len(sub_data):
-            print(f"      [ERROR] Longitud de valor inválida ({value_length} bytes) para el campo {hex(sub_id)}. Fin esperado: {value_end}. Real: {len(sub_data)}")
+            print(f"      [ERROR] Longitud de valor inválida ({value_length} bytes) para el campo {hex(sub_id)}. Fin esperado: {value_end}. Real: {len(sub_data)}. Rompiendo ciclo.")
             break
             
         sub_value_bytes = sub_data[value_start:value_end]
@@ -221,7 +226,8 @@ def parse_extended_eb_fields(additional_value):
 
         if sub_id == 0x002D: # Valor de Voltaje (2 bytes, mV)
             if value_length == 2:
-                voltage_mv = int.from_bytes(sub_value_bytes, 'big')
+                # El valor en sí mismo es Big-Endian (WORD)
+                voltage_mv = int.from_bytes(sub_value_bytes, 'big') 
                 voltage_v = voltage_mv / 1000.0
                 print(f"        -> **Voltaje del Dispositivo (0x002D)**: {voltage_v:.3f} V (RAW: {voltage_mv} mV)")
 
@@ -231,38 +237,44 @@ def parse_extended_eb_fields(additional_value):
                 print(f"        -> **Porcentaje de Batería (0x00A8)**: {percentage} %")
         
         elif sub_id == 0x00D5: # Número IMEI (15 bytes ASCII)
-            if value_length == 15:
+            if value_length >= 15:
+                # Decodificamos solo los primeros 15 bytes
                 try:
-                    imei = sub_value_bytes.decode('ascii')
+                    imei = sub_value_bytes[:15].decode('ascii')
                     print(f"        -> **IMEI del Dispositivo (0x00D5)**: {imei}")
                 except UnicodeDecodeError:
                     print(f"        -> [ERROR] IMEI (No se pudo decodificar): {sub_value_bytes.hex()}")
 
         elif sub_id == 0x00C5: # Estado de Alarma Extendido (4 bytes)
             if value_length == 4:
+                # El valor es un DWORD (4 bytes), asumimos Big-Endian (como en JT/T 808)
                 status_ext_int = int.from_bytes(sub_value_bytes, 'big')
                 
-                # Bits 3 y 4: Estado de Posicionamiento Propietario (0x00C5)
+                # Bits 3 y 4: Estado de Posicionamiento Propietario
                 pos_bits = (status_ext_int >> 3) & 0b11
                 if pos_bits == 0b10: pos_status = "Posicionamiento GPS"
                 elif pos_bits == 0b01: pos_status = "Posicionamiento Wi-Fi"
                 elif pos_bits == 0b11: pos_status = "Posicionamiento GPS y Wi-Fi"
                 else: pos_status = "Sin Posicionamiento"
 
-                # Bit 6: Alarma de Vibración
+                # Bit 6: Alarma de Vibración (0: Alarma, 1: Normal)
                 vibration_bit = (status_ext_int >> 6) & 0b1
-                vibration_status = "Normal (No Vibración)" if vibration_bit == 1 else "Alarma de Vibración (Bit 6 = 0)"
+                vibration_status = "Normal (No Vibración)" if vibration_bit == 1 else "**ALARMA DE VIBRACIÓN**"
                 
+                print(f"        -> **Estado de Alarma Extendido (RAW)**: {hex(status_ext_int)}")
                 print(f"        -> **Posicionamiento Adicional (Bits 3-4)**: {pos_status}")
                 print(f"        -> **Estado de Vibración (Bit 6)**: {vibration_status}")
 
         elif sub_id == 0x00B9: # Información de Wi-Fi (Formato ASCII Mac,RSSI)
             try:
-                # El valor debe ser decodificado como ASCII, ya que contiene los caracteres ':', ',', '-'
-                wifi_data_string = sub_value_bytes.decode('ascii')
+                # El primer byte del valor es el conteo de redes (ej: 0x05)
+                count = sub_value_bytes[0]
+                wifi_data_bytes = sub_value_bytes[1:]
+                wifi_data_string = wifi_data_bytes.decode('ascii')
+                
                 wifi_entries = wifi_data_string.split(',')
                 
-                print(f"        -> **Redes Wi-Fi Encontradas (0x00B9)** ({len(wifi_entries)//2} pares MAC, RSSI):")
+                print(f"        -> **Redes Wi-Fi Encontradas (0x00B9)** (Contador: {count}, Pares analizados: {len(wifi_entries)//2}):")
                 for i in range(0, len(wifi_entries), 2):
                     if i + 1 < len(wifi_entries):
                         mac = wifi_entries[i]
@@ -272,10 +284,22 @@ def parse_extended_eb_fields(additional_value):
                 print(f"        -> [ERROR] Error de decodificación de datos Wi-Fi: {e}")
         
         elif sub_id == 0x0089:
-            print(f"        -> **Estado Propietario Extendido (0x0089)**: {sub_value_bytes.hex()}")
+            if value_length == 4:
+                status_prop_ext_int = int.from_bytes(sub_value_bytes, 'big')
+                # Bit 0: Terminal sleep status (0: Activo, 1: Dormido)
+                sleep_status = "Dormido" if (status_prop_ext_int & 0b1) == 1 else "Activo"
+                # Bit 6: Is it lifted (0: Levantado, 1: No Levantado)
+                lift_status = "No Levantado" if (status_prop_ext_int >> 6) & 0b1 else "**LEVANTADO**"
+                
+                print(f"        -> **Estado Propietario Extendido (0x0089)** (RAW): {sub_value_bytes.hex()} (Valor: {hex(status_prop_ext_int)})")
+                print(f"          > Estado de Suspensión (Bit 0): {sleep_status}")
+                print(f"          > Estado de Levantamiento (Bit 6): {lift_status}")
+            else:
+                 print(f"        -> **Estado Propietario Extendido (0x0089)**: {sub_value_bytes.hex()}")
 
         elif sub_id == 0x00B2: 
-            print(f"        -> **ICCID de la SIM (0x00B2)**: {sub_value_bytes.hex()}")
+            # ICCID/Información SIM (Longitud de Valor 10 en la traza: 8951064012473110652f)
+            print(f"        -> **ICCID/Información SIM (0x00B2)**: {sub_value_bytes.hex()}")
 
         else:
             print(f"        -> ID {hex(sub_id)} (No Mapeado): {sub_value_bytes.hex()}")
@@ -450,6 +474,12 @@ def handle_client(conn, addr):
                                 signal_strength = int.from_bytes(additional_value, 'big')
                                 print(f"    -> Fuerza de señal inalámbrica (0x30): {signal_strength}")
 
+                            elif additional_id == 0x31: # ID 0x31: Información Desconocida
+                                print(f"    -> ID 0x31 (Desconocido): {additional_value.hex()}")
+
+                            elif additional_id == 0x32: # ID 0x32: Información Desconocida
+                                print(f"    -> ID 0x32 (Desconocido): {additional_value.hex()}")
+
                             elif additional_id == 0xeb:
                                 # Llamamos a la función dedicada para decodificar la trama extendida
                                 parse_extended_eb_fields(additional_value)
@@ -527,3 +557,4 @@ def start_server():
 # --- Punto de Entrada del Programa (Original) ---
 if __name__ == "__main__":
     start_server()
+
