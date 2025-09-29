@@ -3,6 +3,8 @@ import threading
 import os
 import time
 from datetime import datetime
+import random 
+import struct
 
 # --- Configuración y Constantes ---
 # El servidor escuchará en todas las interfaces (0.0.0.0)
@@ -60,8 +62,15 @@ def escape_jt808(data_bytes):
     escaped = data_bytes.replace(b'\x7d', b'\x7d\x01')
     return b'\x7e' + escaped.replace(b'\x7e', b'\x7d\x02') + b'\x7e'
 
+def calculate_checksum(data):
+    """Calcula el checksum XOR de una secuencia de bytes."""
+    calculated_checksum = 0
+    for byte in data:
+        calculated_checksum ^= byte
+    return calculated_checksum
+
 def create_jt808_packet(message_id, terminal_phone_number_raw, serial_number_raw, body):
-    """Construye un paquete JT/T 808 completo (Usado para el ACK 0x8001)."""
+    """Construye un paquete JT/T 808 completo (Usado para el ACK)."""
     body_length = len(body)
     # Atributos del cuerpo (Longitud en los 10 bits inferiores)
     message_body_attributes = (body_length & 0x03FF).to_bytes(2, 'big') 
@@ -72,16 +81,14 @@ def create_jt808_packet(message_id, terminal_phone_number_raw, serial_number_raw
     checksum_payload = header + body
     
     # Cálculo del Checksum (XOR de todos los bytes, incluyendo el header y el body)
-    calculated_checksum = 0
-    for byte in checksum_payload:
-        calculated_checksum ^= byte
+    calculated_checksum = calculate_checksum(checksum_payload)
     
     raw_frame = checksum_payload + calculated_checksum.to_bytes(1, 'big')
     final_packet = escape_jt808(raw_frame)
     return final_packet, raw_frame.hex()
 
 def parse_status_bits(status_raw):
-    """Decodifica los 4 bytes de información de estado de posición básica (similar al documento del proveedor)."""
+    """Decodifica los 4 bytes de información de estado de posición básica."""
     status_int = int.from_bytes(status_raw, 'big')
     
     # Mapeo de bits según la convención JT/T 808 estándar (0=Norte/Este)
@@ -100,16 +107,11 @@ def parse_status_bits(status_raw):
 
 # --- Decodificadores de Información Adicional (ADDITIONAL INFO) ---
 
-def decode_iccid(value):
-    """Decodifica el ICCID (ID 0x00B2)."""
-    return f"{value.hex().upper()}"
-
+# [Se mantienen las funciones de decodificación de datos adicionales (decode_iccid, decode_extended_status, etc.) intactas]
+def decode_iccid(value): return f"{value.hex().upper()}"
 def decode_extended_status(value):
-    """Decodifica el Estado Propietario Extendido (ID 0x0089)."""
     if len(value) == 4:
         status_int = int.from_bytes(value, 'big')
-        
-        # Bits mapeados según el documento del proveedor
         flags = [
             f"Terminal sleep status: {'1' if (status_int >> 0) & 1 else '0'}",
             f"Card swiping status: {'1' if (status_int >> 1) & 1 else '0'}",
@@ -127,57 +129,37 @@ def decode_extended_status(value):
     return f"RAW: {value.hex()} (Longitud inesperada)"
 
 def decode_extended_alarm(value):
-    """Decodifica el Estado de Alarma Extendido (ID 0x00C5)."""
     if len(value) == 4:
         status_ext_int = int.from_bytes(value, 'big')
-        
         charging_status = "Charged" if (status_ext_int & 0b1) else "Not charged"
-        
-        # Posicionamiento: Bit 1 y 2
         pos_bits = (status_ext_int >> 1) & 0b11
         pos_status = "GPS positioning" if pos_bits == 0b10 else "WIFI positioning" if pos_bits == 0b01 else "Sin Posicionamiento"
-        
         return f"RAW: {value.hex()} | Status:\n      Charging status: {charging_status}\n      Positioning: {pos_status}"
     return f"RAW: {value.hex()} (Longitud inesperada)"
 
 def decode_wifi_data(value):
-    """Decodifica la información de Wi-Fi (ID 0x00B9)."""
     if not value: return "Datos de Wi-Fi vacíos."
-    
     try:
-        # El primer byte es el número de elementos
         count = value[0]
-        # La cadena MAC/RSSI comienza desde el byte 1
         wifi_data_string = value[1:].decode('ascii', errors='ignore').strip('\x00').strip()
-        
         wifi_entries = [e for e in wifi_data_string.split(',') if e]
-        
         output = [f"Number of data items: {count}"]
         output.append("Data item data:")
-        
-        # Agrupa MAC y RSSI
         for i in range(0, len(wifi_entries), 2):
             if i + 1 < len(wifi_entries):
                 mac = wifi_entries[i]
                 rssi = wifi_entries[i+1]
                 output.append(f"      {mac},{rssi}")
-        
         return "\n    ".join(output)
     except Exception as e:
         return f"[ERROR] Fallo en decodificación Wi-Fi: {e}"
 
-# Mapeo de IDs adicionales a funciones de decodificación
-# Formato: ID (int): (Nombre, Longitud Fija Implícita (si la tiene, 0 si es variable), Función de Decodificación)
 ADDITIONAL_INFO_DECODERS = {
-    # 1-byte IDs (Longitud de 1 byte después del ID)
     0x01: ("Mileage (km)", 4, lambda v: f"{int.from_bytes(v, 'big') / 10.0:.1f}"),
     0x30: ("Wireless communication network signal strength", 1, lambda v: f"{int.from_bytes(v, 'big')}"),
     0x31: ("Number of GSNN positioning satellites", 1, lambda v: f"{int.from_bytes(v, 'big')}"),
     0x32: ("Exercise duration (s)", 2, lambda v: f"{int.from_bytes(v, 'big')}"),
     0x33: ("Device mode", 1, lambda v: MODE_MAP.get(v[0], "Unknown Mode")),
-    
-    # 2-byte IDs (Longitud de 1 byte después de los 2 bytes de ID)
-    # Nota: 0x000C es una excepción, el proveedor lo usa a veces como Longitud Total
     0x000C: ("Placeholder Desconocido (0x000C)", 0, lambda v: f"RAW: {v.hex()}"), 
     0x00B2: ("ICCID number", 20, decode_iccid),
     0x0089: ("EB extended information ID", 4, decode_extended_status),
@@ -185,15 +167,12 @@ ADDITIONAL_INFO_DECODERS = {
     0x002D: ("Unknown information ID (Voltage)", 2, lambda v: f"RAW: {v.hex()}"), 
     0x00A8: ("Battery level (%)", 1, lambda v: f"{v[0]}"),
     0x00D5: ("IMEI", 15, lambda v: v.decode('ascii', errors='ignore').strip('\x00')),
-    0x00B9: ("Wifi information point", 0, decode_wifi_data), # Longitud variable
+    0x00B9: ("Wifi information point", 0, decode_wifi_data),
     0xEB: ("Unknown Proprietary ID (0xEB)", 0, lambda v: f"RAW: {v.hex()} (ID que causó el fallo anterior)"),
 }
 
 def parse_additional_info(message_body, additional_info_start):
-    """
-    Extrae y decodifica la información adicional (TLV extendido).
-    Busca IDs de 2 bytes (0x00XX) primero, y luego IDs de 1 byte (0xXX).
-    """
+    """Extrae y decodifica la información adicional (TLV extendido)."""
     current_byte = additional_info_start
     output = []
     
@@ -202,41 +181,23 @@ def parse_additional_info(message_body, additional_info_start):
         additional_id = None
         additional_length = None
         id_raw_hex = None
-        id_size = 0
         
         # 1. Intentar parsear ID de 2 bytes (XXYY) + Longitud de 1 byte (Z)
-        if current_byte + 3 <= len(message_body):
-            id_2_bytes = int.from_bytes(message_body[current_byte:current_byte+2], 'big')
-            length_1_byte = message_body[current_byte+2]
-            
-            if id_2_bytes in ADDITIONAL_INFO_DECODERS:
-                additional_id = id_2_bytes
-                additional_length = length_1_byte
-                id_raw_hex = message_body[current_byte:current_byte+2].hex().upper()
-                id_size = 2
-                current_byte += 3
+        if current_byte + 3 <= len(message_body) and (int.from_bytes(message_body[current_byte:current_byte+2], 'big') in ADDITIONAL_INFO_DECODERS):
+            additional_id = int.from_bytes(message_body[current_byte:current_byte+2], 'big')
+            additional_length = message_body[current_byte+2]
+            id_raw_hex = message_body[current_byte:current_byte+2].hex().upper()
+            current_byte += 3
         
         # 2. Si el ID de 2 bytes no fue reconocido, intentar ID de 1 byte (X) + Longitud de 1 byte (Y)
-        if additional_id is None and current_byte + 2 <= len(message_body):
-            id_1_byte = message_body[current_byte]
-            
-            if id_1_byte in ADDITIONAL_INFO_DECODERS:
-                additional_id = id_1_byte
-                additional_length = message_body[current_byte+1]
-                id_raw_hex = message_body[current_byte:current_byte+1].hex().upper()
-                id_size = 1
-                current_byte += 2
-            
-            # Caso especial: Si es 0xEB, que tiene la misma estructura (1-byte ID, 1-byte length)
-            elif id_1_byte == 0xEB:
-                additional_id = 0xEB
-                additional_length = message_body[current_byte+1]
-                id_raw_hex = message_body[current_byte:current_byte+1].hex().upper()
-                id_size = 1
-                current_byte += 2
+        elif current_byte + 2 <= len(message_body) and (message_body[current_byte] in ADDITIONAL_INFO_DECODERS or message_body[current_byte] == 0xEB):
+            additional_id = message_body[current_byte]
+            additional_length = message_body[current_byte+1]
+            id_raw_hex = message_body[current_byte:current_byte+1].hex().upper()
+            current_byte += 2
 
-        # 3. Si no se reconoce, parar el parseo para evitar leer datos basura
-        if additional_id is None:
+        # 3. Si no se reconoce, parar el parseo 
+        else:
             output.append(f"  [ERROR] ID desconocido o formato inválido en byte {current_byte}. Deteniendo parseo.")
             break
 
@@ -265,87 +226,94 @@ def parse_additional_info(message_body, additional_info_start):
 
     return "\n".join(output)
 
-# --- Función Principal de Parseo del Reporte de Posición ---
-
 def parse_jt808_position_report(payload_for_checksum):
-    """
-    Decodifica el cuerpo del reporte de posición (0x0200) y la cabecera.
-    """
+    """Decodifica el cuerpo del reporte de posición (0x0200) y la cabecera."""
     
     # 1. Cabecera (12 bytes)
-    message_id_raw = payload_for_checksum[0:2]
-    body_attributes_raw = payload_for_checksum[2:4]
-    terminal_phone_number_raw = payload_for_checksum[4:10]
-    message_serial_number_raw = payload_for_checksum[10:12]
-    
-    message_id = int.from_bytes(message_id_raw, 'big')
-    body_length = int.from_bytes(body_attributes_raw, 'big') & 0x03FF
-    terminal_id = terminal_phone_number_raw.hex()
-    message_serial_number = int.from_bytes(message_serial_number_raw, 'big')
-    
-    message_body = payload_for_checksum[12:12 + body_length]
+    # [... Extracción de cabecera omitida por brevedad, se mantiene en handle_client]
+    message_body = payload_for_checksum[12:]
+    body_length = len(message_body)
     
     # 2. Información Básica de Posición (28 bytes)
-    # 0-3: Alarm flag (4 bytes)
-    alarm_flag_raw = message_body[0:4]
-    # 4-7: Status information (4 bytes)
-    status_raw = message_body[4:8]
-    status_info = parse_status_bits(status_raw)
-    # 8-11: Latitude (4 bytes)
-    latitude_val = int.from_bytes(message_body[8:12], 'big') / 1_000_000.0
-    # 12-15: Longitude (4 bytes)
-    longitude_val = int.from_bytes(message_body[12:16], 'big') / 1_000_000.0
-    # 16-17: Altitude (2 bytes)
-    altitude_val = int.from_bytes(message_body[16:18], 'big')
-    # 18-19: Speed (2 bytes)
-    speed_val = int.from_bytes(message_body[18:20], 'big') / 10.0
-    # 20-21: Direction (2 bytes)
-    direction_val = int.from_bytes(message_body[20:22], 'big')
-    # 22-27: Terminal Time (6 bytes BCD)
-    time_raw = message_body[22:28]
-    time_str = datetime.strptime(time_raw.hex(), '%y%m%d%H%M%S').strftime('20%y-%m-%d %H:%M:%S')
+    if body_length < 28:
+        return "  [ERROR] Cuerpo del mensaje 0x0200 demasiado corto."
+
+    try:
+        # Usamos struct.unpack para decodificar los primeros 28 bytes de forma más clara
+        # '> I I f f H H 6s' -> Big Endian: Alarm(4), Status(4), Lat(4), Lon(4), Alt(2), Speed(2), Dir(2), Time(6 BCD)
+        # Nota: JT/T 808 usa enteros para Lat/Lon, no floats, así que se ajusta el unpack
+        
+        # Extracción de campos
+        alarm_flag_raw = message_body[0:4]
+        status_raw = message_body[4:8]
+        latitude_int = struct.unpack('>I', message_body[8:12])[0]
+        longitude_int = struct.unpack('>I', message_body[12:16])[0]
+        altitude_val = struct.unpack('>H', message_body[16:18])[0]
+        speed_val_raw = struct.unpack('>H', message_body[18:20])[0] # BCD x 10
+        direction_val = struct.unpack('>H', message_body[20:22])[0]
+        time_raw = message_body[22:28]
+
+        # Conversiones
+        status_info = parse_status_bits(status_raw)
+        latitude_val = latitude_int / 1_000_000.0
+        longitude_val = longitude_int / 1_000_000.0
+        speed_val = speed_val_raw / 10.0 # BCD x 10, lo dividimos
+        time_str = datetime.strptime(time_raw.hex(), '%y%m%d%H%M%S').strftime('20%y-%m-%d %H:%M:%S')
+
+    except struct.error as e:
+        return f"  [ERROR] Fallo al decodificar campos básicos de posición: {e}"
+    except ValueError as e:
+        return f"  [ERROR] Fallo al decodificar el tiempo BCD: {e}"
 
     # 3. Información Adicional (a partir del byte 28 del cuerpo)
     additional_info_str = parse_additional_info(message_body, 28)
 
     # 4. Construir la salida detallada
-    
     output = []
-    output.append(f"  --- CABECERA DEL MENSAJE ---")
-    output.append(f"  [0x{message_id_raw.hex().upper()}] Message ID: {hex(message_id)}")
-    output.append(f"  [0x{body_attributes_raw.hex().upper()}] Protocol data length: {body_length} bytes")
-    output.append(f"  [0x{terminal_phone_number_raw.hex().upper()}] Terminal mobile phone number: {terminal_id}")
-    output.append(f"  [0x{message_serial_number_raw.hex().upper()}] Message serial number: {message_serial_number}")
-    output.append(f"\n  --- DATOS BÁSICOS DE POSICIÓN (BODY) ---")
+    output.append(f"  --- DATOS BÁSICOS DE POSICIÓN (BODY) ---")
     output.append(f"  [0x{alarm_flag_raw.hex().upper()}] Alarm flag")
     output.append(f"  [0x{status_raw.hex().upper()}] Status information:")
     output.append(f"    - ACC status: {status_info['ACC status']}")
     output.append(f"    - Positioning: {status_info['Positioning']}")
     output.append(f"    - Latitude direction: {status_info['Latitude direction']}")
     output.append(f"    - Longitude direction: {status_info['Longitude direction']}")
-    output.append(f"  [0x{message_body[8:12].hex().upper()}] Latitude: {latitude_val:.6f}")
-    output.append(f"  [0x{message_body[12:16].hex().upper()}] Longitude: {longitude_val:.6f}")
-    output.append(f"  [0x{message_body[16:18].hex().upper()}] Altitude: {altitude_val} m")
-    output.append(f"  [0x{message_body[18:20].hex().upper()}] Speed: {speed_val:.1f} km/h")
-    output.append(f"  [0x{message_body[20:22].hex().upper()}] Direction: {direction_val}°")
+    output.append(f"  Latitude: {latitude_val:.6f}")
+    output.append(f"  Longitude: {longitude_val:.6f}")
+    output.append(f"  Altitude: {altitude_val} m")
+    output.append(f"  Speed: {speed_val:.1f} km/h")
+    output.append(f"  Direction: {direction_val}°")
     output.append(f"  [0x{time_raw.hex().upper()}] Terminal Time: {time_str}")
     
-    output.append(f"\n  --- INFORMACIÓN ADICIONAL DEL CUERPO (TLV) ---")
-    output.append(additional_info_str)
+    if body_length > 28:
+        output.append(f"\n  --- INFORMACIÓN ADICIONAL DEL CUERPO (TLV) ---")
+        output.append(additional_info_str)
+    else:
+        output.append(f"\n  --- SIN INFORMACIÓN ADICIONAL ---")
+        
     output.append(f"  --- FIN DE PARSEO DE TRAMA 0x0200 ---")
 
     return "\n".join(output)
 
 # --- Lógica del Servidor TCP ---
 
+def send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id_original):
+    """Construye y envía el ACK Universal 0x8001."""
+    response_message_id = 0x8001
+    response_result = 0x00 # Éxito
+    # Body: Serial del mensaje original (2 bytes) + ID del mensaje original (2 bytes) + Resultado (1 byte)
+    response_body = message_serial_number_raw + message_id_original.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
+    
+    final_response, _ = create_jt808_packet(response_message_id, terminal_phone_number_raw, message_serial_number_raw, response_body)
+    conn.sendall(final_response)
+    print(f"    <- [ACK {hex(response_message_id)}] Enviado respuesta a Serial {int.from_bytes(message_serial_number_raw, 'big')} (Target: {hex(message_id_original)}).")
+
 def handle_client(conn, addr):
-    """Maneja la conexión con el cliente, enfocado en el ACK del 0x0200."""
+    """Maneja la conexión con el cliente, implementando ACK para los mensajes principales."""
     print(f"[NUEVA CONEXIÓN] Cliente {addr} conectado.")
     conn.settimeout(TIMEOUT_IN_SECONDS)
 
     try:
         while True:
-            # Recibir datos. Usamos un buffer grande para tramas con datos Wi-Fi.
             data = conn.recv(2048) 
             if not data: break
             
@@ -359,12 +327,10 @@ def handle_client(conn, addr):
                 
             checksum_received = processed_data[-1]
             payload_for_checksum = processed_data[:-1]
-            
-            calculated_checksum = 0
-            for byte in payload_for_checksum: calculated_checksum ^= byte
+            calculated_checksum = calculate_checksum(payload_for_checksum)
             
             if calculated_checksum != checksum_received:
-                print(f"  [ERROR] Checksum INCORRECTO. Descartando mensaje.")
+                print(f"  [ERROR] Checksum INCORRECTO. Calculado: {hex(calculated_checksum)}, Recibido: {hex(checksum_received)}. Descartando mensaje.")
                 continue
 
             # 3. Parseo Básico de Cabecera
@@ -375,26 +341,48 @@ def handle_client(conn, addr):
             
             print(f"\n[DATOS RECIBIDOS de {addr}] (ID: {hex(message_id)}, Serial: {message_serial_number})")
 
-            # 4. Lógica de Decodificación y ACK
-            if message_id == 0x0200: # REPORTE DE POSICIÓN
-                decoded_report = parse_jt808_position_report(payload_for_checksum)
-                print(decoded_report)
+            # 4. Lógica de Respuesta (ACKs)
+            
+            if message_id == 0x0100: # REGISTRO DEL TERMINAL
                 
-                # Envío de ACK Universal (0x8001)
-                response_message_id = 0x8001
-                response_result = 0x00 # Éxito
-                # Body: Serial del mensaje original (2 bytes) + ID del mensaje original (2 bytes) + Resultado (1 byte)
-                response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
+                # Generamos un código de autenticación (ejemplo, puede ser fijo o dinámico)
+                auth_code = f"AUTH-{random.randint(1000, 9999)}" 
+                auth_code_bytes = auth_code.encode('gbk') # JT/T 808 usa GBK
+                
+                # Respuesta de Registro (0x8100)
+                response_message_id = 0x8100
+                response_result = 0x00 # Success
+                
+                # Body: Serial del mensaje original (2 bytes) + Resultado (1 byte) + Código de autenticación (STRING)
+                response_body = message_serial_number_raw + response_result.to_bytes(1, 'big') + auth_code_bytes
                 
                 final_response, _ = create_jt808_packet(response_message_id, terminal_phone_number_raw, message_serial_number_raw, response_body)
                 conn.sendall(final_response)
-                print(f"    <- [ACK {hex(response_message_id)}] Enviado respuesta a Serial {message_serial_number}.")
+                
+                print(f"    <- [ACK {hex(response_message_id)}] Enviado respuesta de registro exitosa a Serial {message_serial_number}.")
+                print(f"       Código de Autenticación asignado: {auth_code}")
+
+            elif message_id == 0x0200: # REPORTE DE POSICIÓN
+                decoded_report = parse_jt808_position_report(payload_for_checksum)
+                print(decoded_report)
+                send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
             
-            elif message_id == 0x0100: # Registro del Terminal (puede necesitar ACK también)
-                 print("    -> [Mensaje 0x0100] Recibido registro de terminal. Implementar lógica de respuesta 0x8100.")
-            
+            elif message_id == 0x0002: # LATIDO (HEARTBEAT)
+                # El latido es simple, solo necesita un ACK 0x8001
+                print("    -> [Mensaje 0x0002] Recibido Latido (Heartbeat).")
+                send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
+
+            elif message_id == 0x0003: # CANCELACIÓN DE TERMINAL (LOGOUT)
+                # Se envía un ACK Universal 0x8001 y se cierra la conexión
+                print("    -> [Mensaje 0x0003] Recibida Solicitud de Cierre de Sesión.")
+                send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
+                time.sleep(0.5) # Espera corta antes de cerrar la conexión
+                break # Sale del bucle para cerrar la conexión
+
             else:
-                 print(f"    -> [Mensaje {hex(message_id)}] Mensaje recibido no manejado (No 0x0200).")
+                 # ACK Universal para cualquier otro mensaje que no necesite lógica especializada
+                 print(f"    -> [Mensaje {hex(message_id)}] Mensaje recibido no manejado (Genérico).")
+                 send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
 
     except socket.timeout:
         print(f"[TIMEOUT] Cliente {addr} inactivo. Cerrando conexión.")
@@ -424,10 +412,10 @@ def start_server():
     except Exception as e:
         print(f"[ERROR CRÍTICO DEL SERVIDOR] El servidor principal falló: {e}")
     finally:
-        server_socket.close()
+        if 'server_socket' in locals():
+            server_socket.close()
 
 
 if __name__ == "__main__":
     # Inicia el servidor.
     start_server()
-
