@@ -1,582 +1,332 @@
-import socket
-import threading
-import os
-import time
 import struct
-import random 
+import re
+from datetime import datetime
 
-# --- Configuración del Servidor ---
-HOST = '0.0.0.0'
-PORT = int(os.environ.get('PORT', 5432))
-TIMEOUT_IN_SECONDS = 30 * 60 # 30 minutos
-
-# --- Mapeo de Valores a Descripciones ---
-
-# Mapeo para el Modo de Dispositivo (ID Adicional 0x33)
-MODE_MAP = {
-    0x00: "Modo Normal (Seguimiento Continuo)",
-    0x01: "Modo de Ultra-larga duración (Ahorro de energía)",
-}
-
-# --- Función para Des-escapar Bytes JT/T 808 ---
-def unescape_jt808(data_bytes_with_delimiters):
+class JT808Decoder:
     """
-    Des-escapa los bytes de un mensaje JT/T 808 (elimina 0x7d 0x01 -> 0x7d y 0x7d 0x02 -> 0x7e).
+    Decodificador de paquetes basado en el protocolo JT/T 808 y extensiones propietarias
+    para el mensaje de Reporte de Posición (0x0200).
     """
-    if data_bytes_with_delimiters.startswith(b'\x7e') and \
-       data_bytes_with_delimiters.endswith(b'\x7e'):
-        data_to_unescape = data_bytes_with_delimiters[1:-1]
-    else:
-        data_to_unescape = data_bytes_with_delimiters
 
-    unescaped_bytes = bytearray()
-    i = 0
-    while i < len(data_to_unescape):
-        if data_to_unescape[i] == 0x7d:
-            if i + 1 < len(data_to_unescape):
-                if data_to_unescape[i+1] == 0x01:
-                    unescaped_bytes.append(0x7d)
-                    i += 2
-                elif data_to_unescape[i+1] == 0x02:
-                    unescaped_bytes.append(0x7e)
-                    i += 2
+    def __init__(self):
+        # Mapeo de valores de estado de posición (Status bits)
+        self.status_map = {
+            0: "ACC: Apagado (OFF)",
+            1: "ACC: Encendido (ON)",
+            2: "Posicionamiento: No Posicionado",
+            3: "Posicionamiento: Posicionado",
+        }
+        
+        # Longitudes de campo específicas para el bloque propietario (0xEB)
+        # Esto es necesario debido a inconsistencias observadas en el protocolo.
+        self.eb_field_lengths = {
+            0x0089: 6,   # Estado extendido
+            0x00C5: 6,   # Alarma extendida
+            0x002D: 2,   # Voltaje (Se corrige de 4 a 2 bytes de valor)
+            0x00A8: 1,   # Porcentaje de batería (Se corrige de 3/4 a 1 byte de valor)
+            0x00D5: 15,  # IMEI
+            0x00B9: -1   # Información WiFi (longitud variable, se consume el resto del paquete)
+        }
+
+    def _hex_to_bytes(self, hex_string):
+        """Convierte una cadena hexadecimal en un objeto bytes."""
+        return bytes.fromhex(hex_string)
+
+    def _des_escape(self, hex_body):
+        """
+        Realiza la des-escapación de la carga útil del paquete.
+        7D 01 -> 7D
+        7D 02 -> 7E
+        """
+        # Expresiones regulares para manejar los reemplazos
+        hex_body = hex_body.replace('7d01', '7d')
+        hex_body = hex_body.replace('7d02', '7e')
+        return hex_body
+
+    def _xor_checksum(self, data_bytes):
+        """Calcula el checksum XOR de los bytes de la trama."""
+        checksum = 0
+        for byte in data_bytes:
+            checksum ^= byte
+        return checksum
+
+    def _decode_bcd(self, bcd_bytes):
+        """Decodifica un campo BCD (como la hora o el número de teléfono)."""
+        return bcd_bytes.hex()
+
+    def _decode_position_status(self, status_dword):
+        """Decodifica los bits de estado de la posición."""
+        acc_status = self.status_map[status_dword & 0b1]
+        pos_status = self.status_map[(status_dword >> 1) & 0b1] + 'Posicionado' if (status_dword >> 1) & 0b1 else 'No Posicionado'
+
+        return {
+            "RAW": f"0x{status_dword:08X}",
+            "ACC": acc_status,
+            "Posicionamiento": pos_status,
+        }
+
+    def _decode_time(self, bcd_bytes):
+        """Decodifica la hora BCD (YYMMDDhhmmss) a un objeto datetime."""
+        bcd_str = self._decode_bcd(bcd_bytes)
+        year = int(bcd_str[0:2]) + 2000
+        month = int(bcd_str[2:4])
+        day = int(bcd_str[4:6])
+        hour = int(bcd_str[6:8])
+        minute = int(bcd_str[8:10])
+        second = int(bcd_str[10:12])
+        try:
+            # Nota: El dispositivo reporta en UTC+8.
+            return datetime(year, month, day, hour, minute, second)
+        except ValueError:
+            return "Fecha/Hora Inválida"
+
+    def decode_proprietary_eb(self, eb_bytes):
+        """
+        Decodifica el bloque de Información Extendida Propietaria (0xEB).
+        Estructura asumida: [Length(WORD) | ID(WORD) | Value(Length bytes)]
+        """
+        results = {}
+        ptr = 0
+
+        # 1. Saltamos el encabezado propietario de 15 bytes
+        EB_HEADER_LEN = 15
+        if len(eb_bytes) < EB_HEADER_LEN:
+            results["ERROR_HEADER"] = "Longitud insuficiente para encabezado EB."
+            return results
+        
+        results["Encabezado Propietario (RAW)"] = eb_bytes[0:EB_HEADER_LEN].hex()
+        ptr += EB_HEADER_LEN
+
+        # 2. Decodificación de campos TLV internos
+        while ptr < len(eb_bytes):
+            try:
+                # La estructura es inestable. Intentamos leer Longitud (WORD) e ID (WORD).
+                # Usamos >H para Big-Endian WORD (2 bytes)
+                field_len_raw, field_id = struct.unpack('>HH', eb_bytes[ptr:ptr+4])
+                ptr += 4
+                
+                # Determinamos la longitud real del valor (reparación del protocolo)
+                if field_id in self.eb_field_lengths and self.eb_field_lengths[field_id] != -1:
+                    value_len = self.eb_field_lengths[field_id]
                 else:
-                    unescaped_bytes.append(data_to_unescape[i])
-                    i += 1
-            else:
-                unescaped_bytes.append(data_to_unescape[i])
-                i += 1
-        else:
-            unescaped_bytes.append(data_to_unescape[i])
-            i += 1
-    return bytes(unescaped_bytes)
-
-# --- Función para Escapar Bytes JT/T 808 para Respuestas ---
-def escape_jt808(data_bytes):
-    """
-    Escapa los bytes de un mensaje JT/T 808 (reemplaza 0x7d -> 0x7d 0x01 y 0x7e -> 0x7d 0x02).
-    """
-    escaped = data_bytes.replace(b'\x7d', b'\x7d\x01')
-    escaped = escaped.replace(b'\x7e', b'\x7d\x02')
-    return escaped
-
-# --- Constructor de Paquetes JT/T 808 ---
-def create_jt808_packet(message_id, terminal_phone_number_raw, serial_number_raw, body):
-    """
-    Construye un paquete JT/T 808 completo (Header + Body + Checksum + Escaping + Delimiters).
-    """
-    body_length = len(body)
-    # Atributos: Longitud del cuerpo (10 bits)
-    message_body_attributes = (body_length & 0x03FF).to_bytes(2, 'big')
-
-    # Header: ID + Atributos + Teléfono + Serie
-    header = message_id.to_bytes(2, 'big') + \
-             message_body_attributes + \
-             terminal_phone_number_raw + \
-             serial_number_raw
-    
-    # Payload para Checksum: Header + Body
-    checksum_payload = header + body
-
-    # Calcular Checksum (XOR de todos los bytes del Header y Body)
-    calculated_checksum = 0
-    for byte in checksum_payload:
-        calculated_checksum ^= byte
-    
-    # Trama RAW: Payload + Checksum
-    raw_frame = checksum_payload + calculated_checksum.to_bytes(1, 'big')
-
-    # Escapar la Trama RAW
-    escaped_frame = escape_jt808(raw_frame)
-
-    # Añadir Delimitadores (0x7e)
-    final_packet = b'\x7e' + escaped_frame + b'\x7e'
-    
-    return final_packet, raw_frame.hex()
-
-# --- Constructor de Comando 0x8103 (Establecer Parámetros) ---
-def build_set_parameters_command(phone_number_raw, current_serial_number):
-    """
-    Construye un comando 0x8103 (Establecer Parámetros).
-    """
-    COMMAND_ID = 0x8103
-    
-    # Parámetro 1: ID 0x0027 (Intervalo de reporte de posición), Longitud 4 bytes
-    param_id_27 = 0x0027
-    param_len_27 = 0x04
-    param_value_27 = 60 # 60 segundos
-    
-    # Parámetro 2: ID 0x0045 (Umbral de bajo voltaje), Longitud 4 bytes (Float)
-    param_id_45 = 0x0045
-    param_len_45 = 0x04
-    # 3.5V (Umbral de bajo voltaje) convertido a 4 bytes IEEE 754 Big-Endian
-    param_value_45 = struct.pack('>f', 3.5) 
-    
-    # Cuerpo del mensaje 0x8103:
-    body_payload = b'\x02' # Conteo de Parámetros (N=2)
-    
-    # Parámetro 1 (Intervalo)
-    body_payload += param_id_27.to_bytes(4, 'big') # ID de Parámetro (4 bytes)
-    body_payload += param_len_27.to_bytes(1, 'big') # Longitud de Valor (1 byte)
-    body_payload += param_value_27.to_bytes(4, 'big') # Valor (4 bytes)
-    
-    # Parámetro 2 (Low Voltage)
-    body_payload += param_id_45.to_bytes(4, 'big') 
-    body_payload += param_len_45.to_bytes(1, 'big') 
-    body_payload += param_value_45 
-    
-    command_serial_raw = ((current_serial_number + 1) % 65536).to_bytes(2, 'big')
-    
-    print("\n    -> [COMANDO] Preparando comando de Establecer Parámetros (0x8103):")
-    print(f"        - Parámetros: 1. Intervalo de Reporte (ID 0x0027) = {param_value_27} s.")
-    print(f"        - Parámetros: 2. Umbral de Bajo Voltaje (ID 0x0045) = 3.5 V.")
-
-
-    final_packet, raw_frame_hex = create_jt808_packet(
-        COMMAND_ID,
-        phone_number_raw,
-        command_serial_raw,
-        body_payload
-    )
-    
-    return final_packet, command_serial_raw, raw_frame_hex, COMMAND_ID
-
-# --- Función para interpretar los bits de estado de posición (4 bytes) ---
-def parse_status_bits(status_raw):
-    """
-    Decodifica los 4 bytes de información de estado de posición (Byte 4-8 del cuerpo 0x0200).
-    """
-    status_int = int.from_bytes(status_raw, 'big')
-    
-    # Bit 0: Estado ACC
-    acc_status = "Encendido (ACC ON)" if (status_int & 0b1) == 1 else "Apagado (ACC OFF)"
-    
-    # Bit 1: Posicionamiento (0x0200 estándar JT/T 808)
-    pos_bit_std = (status_int >> 1) & 0b1
-    pos_status_std = "Posicionado" if pos_bit_std == 1 else "No Posicionado"
-    
-    # Bit 29: Tipo Latitud (0: Norte, 1: Sur)
-    latitude_type = "Sur (S)" if (status_int >> 29) & 0b1 else "Norte (N)" 
-    
-    # Bit 30: Tipo Longitud (0: Este, 1: Oeste)
-    longitude_type = "Oeste (W)" if (status_int >> 30) & 0b1 else "Este (E)" 
-
-    return {
-        "Raw Hex": status_raw.hex(),
-        "Estado ACC": acc_status,
-        "Estado Posición Estándar (Bit 1)": pos_status_std,
-        "Tipo Latitud": latitude_type,
-        "Tipo Longitud": longitude_type,
-        "Valor RAW Completo": hex(status_int)
-    }
-
-# --- Función para parsear sub-campos de la trama extendida 0xEB (CORREGIDA V4.2) ---
-def parse_extended_eb_fields(additional_value):
-    """
-    Analiza la sub-trama extendida (ID 0xeb) utilizando la estructura L-ID-Valor.
-    CORRECCIÓN V4.2: Se asume que la Longitud (L) y el ID (T) son Big-Endian (BE), 
-    y que la longitud L es la longitud total del bloque (ID + Valor).
-    """
-    sub_data = additional_value
-    
-    # Offset Inicial Propietario
-    initial_offset = 15
-    sub_current_byte = initial_offset
-    
-    print("    - INICIO DE DECODIFICACIÓN DETALLADA DE 0xEB (Información Extendida Propietaria):")
-    print(f"      [DEBUG] Saltando {initial_offset} bytes de encabezado propietario: {sub_data[0:initial_offset].hex()}")
-
-    if sub_current_byte >= len(sub_data):
-        print("      [AVISO] No hay datos restantes después de saltar el encabezado.")
-        return
-
-    while sub_current_byte < len(sub_data):
-        
-        # 1. Leer Longitud del Bloque (2 bytes, BE)
-        if sub_current_byte + 2 > len(sub_data): 
-            print(f"      [AVISO] Datos insuficientes para leer la longitud total del bloque. Posición: {sub_current_byte}. Rompiendo ciclo.")
-            break
-            
-        # L: Longitud total del bloque (ID + Valor). Debe ser BE. (CORRECCIÓN V4.2)
-        sub_length_block = int.from_bytes(sub_data[sub_current_byte:sub_current_byte+2], 'big')
-        
-        # 2. Leer ID del Bloque (2 bytes, BE)
-        id_start = sub_current_byte + 2
-        if id_start + 2 > len(sub_data): 
-            print(f"      [AVISO] Datos insuficientes para leer el ID del bloque. Posición: {id_start}. Rompiendo ciclo.")
-            break
-            
-        sub_id_raw_full = sub_data[id_start:id_start+2]
-        
-        # El ID Lógico (ej: 0x89, 0xC5) es el segundo byte de los 2 bytes del ID de bloque (BE).
-        sub_id_int_1byte = sub_id_raw_full[1] # CORRECCIÓN V4.2: Usamos el segundo byte (index 1)
-        
-        # Creamos el ID lógico completo para impresión/mapeo (ej: 0x0089)
-        logical_id_for_print = int.from_bytes(b'\x00' + sub_id_raw_full[1].to_bytes(1, 'big'), 'big')
-        
-        # 3. Calcular Longitud y Bytes del Valor
-        value_start = id_start + 2
-        
-        # La longitud del valor es la longitud del bloque (L) - 2 bytes de ID (T)
-        value_length = sub_length_block - 2 
-        
-        if value_length < 0 or sub_length_block < 2:
-             print(f"      [ERROR] Longitud de valor calculada inválida ({value_length}) para el campo {hex(logical_id_for_print)}. Rompiendo ciclo.")
-             break
-        
-        value_end = value_start + value_length
-
-        if value_end > len(sub_data):
-            print(f"      [ERROR] Longitud de valor inválida ({value_length} bytes) para el campo {hex(logical_id_for_print)}. Fin esperado: {value_end}. Real: {len(sub_data)}. Rompiendo ciclo.")
-            break
-            
-        sub_value_bytes = sub_data[value_start:value_end]
-        
-        # La impresión muestra el ID de 2 bytes (ej: 00a8) y la longitud (ej: 1)
-        print(f"      > Campo ID (Proprietario RAW): {sub_id_raw_full.hex()} | ID Lógico Mapeado: {hex(logical_id_for_print)} | Longitud Valor: {value_length} bytes | HEX: {sub_value_bytes.hex()}")
-
-        # Mapeamos los IDs LÓGICOS (usando el valor del byte T1: 0x89, 0xC5, etc.)
-        
-        if sub_id_int_1byte == 0x89: # Estado Propietario Extendido
-            if value_length == 4:
-                status_prop_ext_int = int.from_bytes(sub_value_bytes, 'big')
+                    # Usamos la longitud reportada por el campo, pero solo si es razonable
+                    value_len = field_len_raw
                 
-                # Bit 0: Terminal sleep status (0: Activo, 1: Dormido)
-                sleep_status = "Dormido" if (status_prop_ext_int & 0b1) == 1 else "Activo"
-                # Bit 6: Is it lifted (0: Levantado, 1: No Levantado)
-                # El protocolo de análisis indica 0: Normal; 1: Alarma (Bit 6 levantamiento)
-                lift_status = "No Levantado" if (status_prop_ext_int >> 6) & 0b1 else "**LEVANTADO**"
+                # Si el campo es 0x00B9 (Wi-Fi), consume el resto del paquete
+                if field_id == 0x00B9:
+                    value_len = len(eb_bytes) - ptr
                 
-                print(f"        -> **Estado Propietario Extendido (ID 0x0089)** (RAW): {sub_value_bytes.hex()} (Valor: {hex(status_prop_ext_int)})")
-                print(f"          > Estado de Suspensión (Bit 0): {sleep_status}")
-                print(f"          > Estado de Levantamiento (Bit 6): {lift_status}")
-            else:
-                 print(f"        -> **Estado Propietario Extendido (ID 0x0089)**: Longitud inesperada de {value_length} bytes.")
+                if ptr + value_len > len(eb_bytes):
+                    results["ERROR_BREAK"] = f"Desbordamiento de buffer en ID 0x{field_id:04X}. Longitud de valor reportada: {field_len_raw}, Consumida: {value_len}, Restante: {len(eb_bytes) - ptr}. Rompiendo ciclo."
+                    break
 
-        elif sub_id_int_1byte == 0xC5: # Estado de Alarma Extendido
-            if value_length == 4:
-                status_ext_int = int.from_bytes(sub_value_bytes, 'big')
-                
-                # Bits 3 y 4: Estado de Posicionamiento Propietario
-                pos_bits = (status_ext_int >> 3) & 0b11
-                if pos_bits == 0b10: pos_status = "Posicionamiento GPS"
-                elif pos_bits == 0b01: pos_status = "Posicionamiento Wi-Fi"
-                elif pos_bits == 0b11: pos_status = "Posicionamiento GPS y Wi-Fi"
-                else: pos_status = "Sin Posicionamiento"
+                value_bytes = eb_bytes[ptr:ptr + value_len]
+                ptr += value_len
 
-                # Bit 6: Alarma de Vibración (1: Normal, 0: Alarma)
-                vibration_bit = (status_ext_int >> 6) & 0b1
-                vibration_status = "Normal (No Vibración)" if vibration_bit == 1 else "**ALARMA DE VIBRACIÓN**"
-                
-                print(f"        -> **Estado de Alarma Extendido (ID 0x00C5)** (RAW): {hex(status_ext_int)}")
-                print(f"          > Posicionamiento Adicional (Bits 3-4): {pos_status}")
-                print(f"          > Estado de Vibración (Bit 6): {vibration_status}")
+                results[f"ID 0x{field_id:04X}"] = self._format_eb_value(field_id, value_bytes)
 
-        elif sub_id_int_1byte == 0x2D: # Voltaje del Dispositivo (2 bytes, mV)
-            # El campo ID 0x2D requiere 2 bytes de valor (L=4).
-            if value_length == 2:
-                # El valor del voltaje se lee como BE (Alto primero)
-                voltage_mv = int.from_bytes(sub_value_bytes, 'big') 
-                voltage_v = voltage_mv / 1000.0
-                # El ejemplo de protocolo usa 36B0 = 14000mV.
-                print(f"        -> **Voltaje (ID 0x002D)**: **{voltage_v:.3f} V** (RAW: {voltage_mv} mV)")
-            else:
-                 print(f"        -> **Voltaje (ID 0x002D)**: Longitud inesperada de {value_length} bytes.")
-
-        elif sub_id_int_1byte == 0xA8: # Porcentaje de Batería (1 byte)
-            # El campo ID 0xA8 requiere 1 byte de valor (L=3).
-            if value_length == 1:
-                percentage = sub_value_bytes[0]
-                print(f"        -> **Porcentaje de Batería (ID 0x00A8)**: **{percentage} %**")
-
-        elif sub_id_int_1byte == 0xD5: # IMEI
-            # El IMEI siempre es de 15 bytes
-            if value_length >= 15:
-                try:
-                    # El valor del IMEI se lee como BCD o STRING
-                    imei = sub_value_bytes[:15].decode('ascii').strip('\x00')
-                    print(f"        -> **IMEI del Dispositivo (ID 0x00D5)**: {imei}")
-                except UnicodeDecodeError:
-                    print(f"        -> [ERROR] IMEI (No se pudo decodificar): {sub_value_bytes.hex()}")
-
-        elif sub_id_int_1byte == 0xB9: # Wi-Fi
-            # El primer byte del valor es el conteo de redes (ej: 0x05). El resto es string ASCII
-            if sub_value_bytes:
-                try:
-                    count = sub_value_bytes[0]
-                    wifi_data_bytes = sub_value_bytes[1:]
-                    
-                    # Decodificar el resto como string ASCII
-                    wifi_data_string = wifi_data_bytes.decode('ascii', errors='ignore').strip('\x00').strip()
-                    
-                    # Split por coma y analizar pares MAC,RSSI
-                    wifi_entries = wifi_data_string.split(',')
-                    
-                    print(f"        -> **Redes Wi-Fi Encontradas (ID 0x00B9)** (Contador reportado: {count}, Pares analizados: {len(wifi_entries)//2}):")
-                    for i in range(0, len(wifi_entries), 2):
-                        if i + 1 < len(wifi_entries):
-                            mac = wifi_entries[i]
-                            rssi = wifi_entries[i+1]
-                            print(f"          > MAC: {mac}, RSSI (dBm): {rssi}")
-                except Exception as e:
-                    print(f"        -> [ERROR] Error de decodificación de datos Wi-Fi: {e}")
-                    print(f"          -> RAW WiFi Data: {sub_value_bytes.hex()}")
-            else:
-                 print("        -> **Redes Wi-Fi Encontradas (ID 0x00B9)**: Datos de Wi-Fi vacíos.")
-        
-        else:
-            print(f"        -> ID {hex(logical_id_for_print)} (No Mapeado): {sub_value_bytes.hex()}")
-        
-        # Avanzar al inicio del siguiente bloque: 2 bytes L + L bytes V
-        # sub_current_byte = sub_current_byte + sub_length_block + 2 # L + L_bytes (2)
-
-        # Corregir el avance: la longitud del bloque L YA incluye el ID (2 bytes) y el valor. 
-        # El avance es 2 bytes (L) + L (ID + Value)
-        sub_current_byte = sub_current_byte + 2 + sub_length_block
-        
-    print("    - FIN DE DECODIFICACIÓN DETALLADA DE 0xEB.")
-
-
-# --- Función para Manejar Cada Cliente Conectado (Resto del código sin cambios) ---
-def handle_client(conn, addr):
-    """
-    Maneja la conexión con el cliente, parseando mensajes y enviando respuestas.
-    """
-    print(f"[NUEVA CONEXIÓN] Cliente {addr} conectado.")
-    conn.settimeout(TIMEOUT_IN_SECONDS)
-    
-    last_terminal_serial = 0 
-
-    try:
-        while True:
-            data = conn.recv(1024)
-
-            if not data:
-                print(f"[DESCONEXIÓN] Cliente {addr} desconectado.")
+            except struct.error:
+                results["ERROR_STRUCT"] = f"Fallo de empaquetado/desempaquetado en la posición {ptr}. Fin inesperado de datos."
                 break
-            
-            processed_data = unescape_jt808(data)
-            
-            print(f"\n[DATOS RECIBIDOS de {addr}] (Hex Crudo: {data.hex()})")
-            print(f"[DATOS PROCESADOS de {addr}] (Hex Des-escapado: {processed_data.hex()})")
+            except Exception as e:
+                results["ERROR_UNKNOWN"] = f"Error inesperado al decodificar: {e}"
+                break
+        
+        return results
 
-            if len(processed_data) < 13: 
-                print(f"[ERROR] Datos demasiado cortos para un mensaje válido.")
-                continue
+    def _format_eb_value(self, field_id, value_bytes):
+        """Formatea los valores conocidos del bloque propietario (0xEB)."""
+        value_hex = value_bytes.hex()
+        
+        if field_id == 0x0089: # Estado Extendido
+            # FFFFFFFF0006 -> La documentación sugiere 4 bytes de estado.
+            dword = struct.unpack('>I', value_bytes[0:4])[0]
+            status_str = f"Bitmask: 0x{dword:08X}"
+            # (Ej. bit3: No Posicionamiento, bit4: Posicionamiento WiFi)
+            return f"Estado Extendido (RAW): {value_hex} | {status_str}"
+        
+        elif field_id == 0x00C5: # Alarma Extendida
+            dword = struct.unpack('>I', value_bytes[0:4])[0]
+            # bitmask: 0xFFFFFFF7. bit3: Posicionamiento WiFi
+            return f"Alarma Extendida (RAW): {value_hex} | Bitmask: 0x{dword:08X}"
 
-            checksum_received = processed_data[-1]
-            payload_for_checksum = processed_data[:-1]
+        elif field_id == 0x002D: # Voltaje
+            if len(value_bytes) >= 2:
+                # Voltaje en mV (Ej. 11F7 = 4600 mV)
+                voltage_mv = struct.unpack('>H', value_bytes[0:2])[0]
+                voltage_v = voltage_mv / 1000.0
+                return f"Voltaje: {voltage_v:.2f} V ({voltage_mv} mV) (RAW: {value_hex})"
+            return f"Voltaje (RAW): {value_hex}"
 
-            # Calculamos el Checksum XOR
-            calculated_checksum = 0
-            for byte in payload_for_checksum:
-                calculated_checksum ^= byte
-            
-            if calculated_checksum == checksum_received:
-                print(f"  [DEBUG] Checksum OK: {hex(checksum_received)}")
-            else:
-                print(f"  [ERROR] Checksum INCORRECTO. Recibido: {hex(checksum_received)}, Calculado: {hex(calculated_checksum)}. Descartando mensaje.")
-                continue
+        elif field_id == 0x00A8: # Porcentaje de Batería
+            if len(value_bytes) >= 1:
+                battery_perc = value_bytes[0]
+                return f"Batería: {battery_perc}% (RAW: {value_hex})"
+            return f"Batería (RAW): {value_hex}"
+        
+        elif field_id == 0x00D5: # IMEI
+            # Se decodifica de HEX a cadena ASCII
+            imei = value_bytes.decode('ascii', errors='ignore')
+            return f"IMEI: {imei} (RAW: {value_hex})"
+        
+        elif field_id == 0x00B9: # Información WiFi
+            # Decodificación de la cadena de MAC/RSSI
+            try:
+                wifi_data = value_bytes.decode('ascii', errors='ignore')
+                return f"Datos WiFi: {wifi_data}"
+            except:
+                return f"Datos WiFi (RAW): {value_hex}"
 
-            # 2. Parsear Cabecera del Mensaje
-            if len(payload_for_checksum) < 12:
-                print(f"[ERROR] Payload demasiado corto para la cabecera.")
-                continue
+        return f"Valor RAW: {value_hex}"
 
-            message_id = int.from_bytes(payload_for_checksum[0:2], 'big')
-            message_body_attributes = int.from_bytes(payload_for_checksum[2:4], 'big')
-            terminal_phone_number_raw = payload_for_checksum[4:10]
-            message_serial_number_raw = payload_for_checksum[10:12]
-
-            body_length = message_body_attributes & 0x03FF 
-            message_body = payload_for_checksum[12:12 + body_length]
-
-            terminal_phone_number_str = terminal_phone_number_raw.hex()
-            message_serial_number = int.from_bytes(message_serial_number_raw, 'big')
-            last_terminal_serial = message_serial_number 
-
-            print(f"  --> ID Mensaje: {hex(message_id)}")
-            print(f"  --> Teléfono Terminal (BCD - 6 bytes): {terminal_phone_number_str}")
-            print(f"  --> Número de Serie (Trama): {message_serial_number}")
-            print(f"  --> Longitud del Cuerpo Esperada: {body_length} bytes (Real: {len(message_body)} bytes)")
-
-            # 3. Lógica de Respuesta
-            response_message_id = None
-            response_result = 0x00 
-            response_body = b''
-            send_command_after_response = False 
-
-            if message_id == 0x0100: 
-                print("  --> Tipo de Mensaje: REGISTRO DE TERMINAL (0x0100) - INICIANDO LOGIN")
+    def decode_tlv_additional_info(self, body_bytes):
+        """
+        Decodifica los bloques de Información Adicional (TLV - Tag/Length/Value)
+        del cuerpo principal del mensaje (ID 1 byte, Longitud 1 byte).
+        """
+        results = {}
+        ptr = 0
+        
+        while ptr < len(body_bytes):
+            try:
+                # ID (BYTE) y Longitud (BYTE)
+                field_id = body_bytes[ptr]
+                field_len = body_bytes[ptr + 1]
+                ptr += 2
                 
-                try:
-                    manufacturer_id = message_body[4:9].decode('gb18030').strip('\x00').strip()
-                    model_terminal = message_body[9:29].decode('gb18030').strip('\x00').strip()
-                    terminal_id_raw = message_body[29:36] 
-                    terminal_id_str = terminal_id_raw.hex()
-                    
-                    print(f"    - ID Fabricante (5 bytes GBK): {manufacturer_id}")
-                    print(f"    - Modelo de Terminal (20 bytes GBK): {model_terminal}")
-                    print(f"    - ID Terminal (7 bytes BCD): {terminal_id_str}")
+                if ptr + field_len > len(body_bytes):
+                    results["ERROR"] = f"Longitud de campo 0x{field_id:02X} excede el cuerpo de la trama."
+                    break
 
-                    response_message_id = 0x8100 
-                    auth_code = b"AUTH_CODE_BSJ_2025" 
-                    response_body = message_serial_number_raw + response_result.to_bytes(1, 'big') + auth_code
-                    print(f"    -> [RESPUESTA] Envío de Código de Autenticación: {auth_code.decode('latin-1')}")
-                    send_command_after_response = True 
-
-                except Exception as e:
-                    print(f"    [ERROR GRAVE] Fallo al decodificar campos de texto del registro: {e}")
-                    response_result = 0x01
-                    response_message_id = 0x8100
-                    response_body = message_serial_number_raw + response_result.to_bytes(1, 'big') + b''
+                value_bytes = body_bytes[ptr:ptr + field_len]
+                ptr += field_len
                 
-            elif message_id == 0x0102:
-                print("  --> Tipo de Mensaje: AUTENTICACIÓN DE TERMINAL (0x0102)")
-                response_message_id = 0x8001
-                response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
-                send_command_after_response = True 
-
-            elif message_id == 0x0200: 
-                print("  --> Tipo de Mensaje: REPORTE DE POSICIÓN (0x0200) - DECODIFICANDO DATOS")
+                # Manejo de IDs conocidos
+                if field_id == 0x30: # Fuerza de señal inalámbrica
+                    value = value_bytes[0]
+                    results["Fuerza de Señal Inalámbrica (0x30)"] = value
                 
-                if len(message_body) < 28:
-                    response_result = 0x01
-                    print("    [ERROR] Cuerpo de posición demasiado corto.")
+                elif field_id == 0x33: # Modo de Trabajo
+                    mode = value_bytes[0]
+                    mode_desc = "Modo de Ultra-larga duración (Ahorro de energía)" if mode == 1 else f"Modo Desconocido (RAW: {mode})"
+                    results["Modo de Trabajo (0x33)"] = mode_desc
+                
+                elif field_id == 0xEB: # Información Extendida Propietaria (¡El bloque problemático!)
+                    results["Info. Extendida Propietaria (0xEB)"] = self.decode_proprietary_eb(value_bytes)
+
                 else:
-                    # Decodificación de información básica
-                    status_raw = message_body[4:8]
-                    status_data = parse_status_bits(status_raw)
+                    results[f"ID Adicional Desconocido (0x{field_id:02X})"] = value_bytes.hex()
 
-                    latitude_raw = int.from_bytes(message_body[8:12], 'big')
-                    longitude_raw = int.from_bytes(message_body[12:16], 'big')
-                    time_raw = message_body[22:28]
-                    
-                    latitude = latitude_raw / 1_000_000.0
-                    longitude = longitude_raw / 1_000_000.0
-                    
-                    try:
-                        time_str = f"20{time_raw[0]:02x}-{time_raw[1]:02x}-{time_raw[2]:02x} {time_raw[3]:02x}:{time_raw[4]:02x}:{time_raw[5]:02x} (UTC+8)"
-                    except IndexError:
-                          time_str = f"Hora no válida: {time_raw.hex()}"
-                    
-                    print("  --- Información de Posición Básica ---")
-                    print(f"  - Estado (RAW): {status_data['Valor RAW Completo']}")
-                    print(f"  - Posicionamiento Estándar (Bit 1): **{status_data['Estado Posición Estándar (Bit 1)']}**")
-                    print(f"  - Estado del ACC (Bit 0): {status_data['Estado ACC']}")
-                    print(f"  - Latitud: {latitude:.6f} ({status_data['Tipo Latitud']})")
-                    print(f"  - Longitud: {longitude:.6f} ({status_data['Tipo Longitud']})")
-                    print(f"  - Hora del Reporte: {time_str}")
-
-                    # --- ANÁLISIS DE LA INFORMACIÓN ADICIONAL (ID 1 byte) ---
-                    additional_info_start = 28
-                    if len(message_body) > additional_info_start:
-                        print("  --- Información Adicional del Cuerpo (ID 1 byte, Propietario o Extendido) ---")
-                        current_byte = additional_info_start
-                        while current_byte < len(message_body):
-                            if current_byte + 2 > len(message_body): break
-
-                            additional_id = message_body[current_byte]
-                            additional_length = message_body[current_byte+1]
-                            
-                            start_value = current_byte + 2
-                            end_value = start_value + additional_length
-                            
-                            if end_value > len(message_body): break
-                            
-                            additional_value = message_body[start_value:end_value]
-                            
-                            print(f"  - ID Adicional: {hex(additional_id)} | Longitud: {additional_length}")
-                            
-                            if additional_id == 0x33: 
-                                device_mode_int = int.from_bytes(additional_value, 'big')
-                                mode_desc = MODE_MAP.get(device_mode_int, "Modo Desconocido")
-                                print(f"    -> Modo de Trabajo (0x33): **{mode_desc}** (Valor RAW: {device_mode_int})")
-                            
-                            elif additional_id == 0x30: 
-                                signal_strength = int.from_bytes(additional_value, 'big')
-                                print(f"    -> Fuerza de señal inalámbrica (0x30): {signal_strength}")
-
-                            elif additional_id == 0x31: 
-                                print(f"    -> ID 0x31 (Desconocido): {additional_value.hex()}")
-
-                            elif additional_id == 0x32: 
-                                print(f"    -> ID 0x32 (Desconocido): {additional_value.hex()}")
-
-                            elif additional_id == 0xeb:
-                                # Llamamos a la función dedicada para decodificar la trama extendida
-                                parse_extended_eb_fields(additional_value)
-                            
-                            else:
-                                print(f"    -> ID {hex(additional_id)} (No Mapeado): {additional_value.hex()}")
-                            
-                            current_byte = end_value 
+            except IndexError:
+                results["ERROR"] = f"Fin inesperado de datos al decodificar TLV en la posición {ptr}."
+                break
+            except Exception as e:
+                results["ERROR"] = f"Error al decodificar bloque TLV: {e}"
+                break
                 
-                # Reconocimiento general para el reporte de posición (0x8001)
-                response_message_id = 0x8001
-                response_body = message_serial_number_raw + message_id.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
+        return results
 
-            elif message_id == 0x0003:
-                print("  --> Tipo de Mensaje: CIERRE DE SESIÓN (0x0003).")
-                response_message_id = None
+    def decode_position_report(self, raw_hex_data):
+        """Procesa y decodifica el paquete completo de reporte de posición."""
+        output = {"Estado": "FALLO"}
 
-            else:
-                print(f"  --> Tipo de Mensaje: ID DESCONOCIDO {hex(message_id)}. No se requiere respuesta.")
+        # 1. Des-escapar la trama completa y extraer el cuerpo
+        if not raw_hex_data.startswith('7e') or not raw_hex_data.endswith('7e'):
+            output["ERROR"] = "La trama no comienza ni termina con el flag 0x7E."
+            return output
+        
+        # Extraer el cuerpo (excluyendo flags de inicio/fin y checksum)
+        escaped_body = raw_hex_data[2:-4] 
+        checksum_hex = raw_hex_data[-4:-2]
+        
+        descaped_body_hex = self._des_escape(escaped_body)
+        descaped_body_bytes = self._hex_to_bytes(descaped_body_hex)
+        
+        # 2. Validación de Checksum
+        calculated_checksum = self._xor_checksum(descaped_body_bytes)
+        expected_checksum = int(checksum_hex, 16)
+        
+        output["Checksum"] = f"Calculado: 0x{calculated_checksum:02X}, Esperado: 0x{expected_checksum:02X}"
+        if calculated_checksum != expected_checksum:
+            output["ERROR"] = "Checksum NO OK. La trama está dañada o la des-escapación falló."
+            output["Estado"] = "ERROR_CHECKSUM"
+            # Continuamos el parsing solo para depuración
+        
+        ptr = 0
+        try:
+            # 3. Decodificación del Encabezado (JT/T 808-like)
+            msg_id, body_len, terminal_phone_bcd, serial_num = struct.unpack('>HH6sH', descaped_body_bytes[ptr:ptr+12])
+            ptr += 12
             
-            # 4. Construcción y Envío de la Respuesta
-            if response_message_id:
-                final_response, raw_frame_hex = create_jt808_packet(
-                    response_message_id,
-                    terminal_phone_number_raw,
-                    message_serial_number_raw,
-                    response_body
-                )
-                
-                conn.sendall(final_response)
-                print(f"  [RESPUESTA ENVIADA a {addr}] Mensaje {hex(response_message_id)} con serial {message_serial_number} y resultado {response_result}.")
-                print(f"    (Trama RAW HEX: {raw_frame_hex})")
-
-                # --- LÓGICA DE COMANDO (NUEVA INTEGRACIÓN) ---
-                if send_command_after_response:
-                    command_packet, command_serial, command_raw_hex, command_id = build_set_parameters_command(
-                        terminal_phone_number_raw,
-                        last_terminal_serial
-                    )
-                    conn.sendall(command_packet)
-                    print(f"  [COMANDO ENVIADO a {addr}] Mensaje {hex(command_id)} con serial {int.from_bytes(command_serial, 'big')}.")
-                    print(f"    (Trama RAW HEX: {command_raw_hex})")
-
-
-    except socket.timeout:
-        print(f"[TIMEOUT] Cliente {addr} inactivo. Cerrando conexión.")
-    except Exception as e:
-        print(f"[ERROR INESPERADO EN CLIENTE] Problema con cliente {addr}: {e}")
-    finally:
-        conn.close()
-        print(f"[CONEXIÓN CERRADA] Conexión con {addr} cerrada.")
-
-# --- Punto de Entrada del Programa ---
-def start_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    try:
-        server_socket.bind((HOST, PORT))
-        server_socket.listen(5)
-        print(f"Servidor TCP escuchando en {HOST}:{PORT}")
-
-        while True:
-            conn, addr = server_socket.accept()
-            client_handler = threading.Thread(target=handle_client, args=(conn, addr))
-            client_handler.start()
+            output["ID Mensaje"] = f"0x{msg_id:04X}"
+            output["Longitud Cuerpo"] = body_len
+            output["Teléfono Terminal (BCD)"] = self._decode_bcd(terminal_phone_bcd)
+            output["Número de Serie"] = serial_num
             
-    except Exception as e:
-        print(f"[ERROR CRÍTICO DEL SERVIDOR] El servidor principal falló: {e}")
-    finally:
-        server_socket.close()
-        print("Servidor TCP detenido.")
+            if msg_id != 0x0200:
+                output["ERROR"] = f"Mensaje ID 0x{msg_id:04X} no soportado (esperado 0x0200)."
+                return output
 
-# --- Punto de Entrada del Programa ---
-if __name__ == "__main__":
-    start_server()
+            # 4. Decodificación del Bloque de Posición (RAW: 28 bytes)
+            # Alarm Flag (DWORD), Status (DWORD), Latitude (DWORD), Longitude (DWORD), Altitude (WORD), 
+            # Speed (WORD), Direction (WORD), Time (BCD 6 bytes)
+            (alarm_flag, status_dword, latitude_raw, longitude_raw, altitude, 
+             speed, direction, time_bcd) = struct.unpack('>IIIIHHH6s', descaped_body_bytes[ptr:ptr+28])
+            ptr += 28
 
+            # Conversión de Lat/Lon (1/10^6 grado)
+            latitude = latitude_raw / 1000000.0
+            longitude = longitude_raw / 1000000.0
+            
+            output["Posicionamiento Básico"] = {
+                "Alarma (RAW)": f"0x{alarm_flag:08X}",
+                "Estado": self._decode_position_status(status_dword),
+                "Latitud": f"{latitude:.6f} grados",
+                "Longitud": f"{longitude:.6f} grados",
+                "Altitud": altitude,
+                "Velocidad": speed,
+                "Dirección": direction,
+                "Hora Reporte (UTC+8)": self._decode_time(time_bcd).strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+            # 5. Decodificación de Información Adicional (TLV)
+            additional_info_bytes = descaped_body_bytes[ptr:ptr + body_len - 28 - 12] # Longitud total - Header - Posicionamiento
+            output["Información Adicional (TLV)"] = self.decode_tlv_additional_info(additional_info_bytes)
+            
+            output["Estado"] = "OK"
+
+        except struct.error:
+            output["ERROR"] = "Error de estructura (longitud de bytes incompleta o incorrecta)."
+            output["Estado"] = "ERROR_STRUCT"
+        except Exception as e:
+            output["ERROR"] = f"Fallo al decodificar: {e}"
+            output["Estado"] = "ERROR_GENERAL"
+            
+        return output
+
+# --- Datos de Prueba ---
+# El "Hex Crudo" proporcionado por el usuario, sin los 7e de inicio y fin.
+# Lo usaremos para que el decodificador haga la des-escapación y checksum.
+RAW_HEX_DATA = "7e020000df0870771382060020000000000000000c00b87d01440497da5d00000000000025092920060801040000000030011a31011132020129330101ebae000c00b28951064012473110652f00060089ffffffff000600c5fffffff70004002d11f7000300a864001100d5383638333837303737313338323036007000b90532413a34373a33443a34353a443341422c2d35342c44433a36323a37393a35343a30393a44452c2d35322c30453a38343a43363a37373a36463a33432c2d35382c30433a30453a763945423a37302c2d35382c41433a38343a43363a37373a36463a33432c2d35399a7e"
+
+decoder = JT808Decoder()
+parsed_data = decoder.decode_position_report(RAW_HEX_DATA)
+
+# Imprimir el resultado de forma legible
+import json
+print("--- RESULTADO DECODIFICACIÓN REESTRUCTURADA ---")
+print(json.dumps(parsed_data, indent=4, ensure_ascii=False))
+
+# Generar la respuesta 0x8001
+# ID Mensaje: 0x8001
+# Longitud: 0x0005 (5 bytes)
+# Teléfono Terminal: 087077138206
+# Serial del mensaje original: 32 (0x0020)
+# Resultado: 0 (Éxito)
+response_body = struct.pack('>H6sBH', 0x0200, b'\x08p\x77\x13\x82\x06', 32, 0)
+response_body_hex = response_body.hex()
+
+checksum = decoder._xor_checksum(response_body)
+response_hex = f"7e80010005{response_body_hex}{checksum:02x}7e"
+print("\n--- RESPUESTA DE PLATAFORMA (0x8001) ---")
+print(f"Trama RAW HEX: {response_hex.upper()}")
