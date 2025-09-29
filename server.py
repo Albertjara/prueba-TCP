@@ -147,7 +147,7 @@ def decode_battery_level(value):
 def decode_imei(value):
     """Decodifica el IMEI (ID 0x00D5)."""
     try:
-        # FIX: Mover la lógica de strip fuera de la f-string
+        # Mover la lógica de strip fuera de la f-string
         decoded_imei = value[:15].decode('ascii', errors='ignore').strip('\x00')
         return f"**{decoded_imei}**"
     except Exception:
@@ -159,7 +159,7 @@ def decode_wifi_data(value):
     
     try:
         count = value[0]
-        # FIX: Mover la lógica de strip fuera de la f-string
+        # Mover la lógica de strip fuera de la f-string
         wifi_data_string = value[1:].decode('ascii', errors='ignore').strip('\x00').strip()
         
         # El patrón es MAC,RSSI,MAC,RSSI,... 
@@ -280,21 +280,21 @@ def parse_query_parameters_response(message_body):
         elif param_id == 0x0010: 
             desc = "APN (Access Point Name)"
             try: 
-                # FIX: Mover el strip fuera de la f-string
+                # Mover el strip fuera de la f-string
                 decoded_string = param_value_raw.decode('ascii', errors='ignore').strip('\x00')
                 display_value = f"**{decoded_string}**"
             except: pass
         elif param_id == 0x0013: 
             desc = "Dirección de Servidor Principal"
             try: 
-                # FIX: Mover el strip fuera de la f-string
+                # Mover el strip fuera de la f-string
                 decoded_string = param_value_raw.decode('ascii', errors='ignore').strip('\x00')
                 display_value = f"**{decoded_string}**"
             except: pass
         elif param_id == 0x0011 or param_id == 0x0012: 
             desc = "Usuario/Contraseña APN"
             try: 
-                # FIX: Mover el strip fuera de la f-string
+                # Mover el strip fuera de la f-string
                 decoded_string = param_value_raw.decode('ascii', errors='ignore').strip('\x00')
                 display_value = f"**{decoded_string}**"
             except: pass
@@ -433,7 +433,8 @@ def handle_client(conn, addr):
                 time_str = f"20{time_raw[0]:02x}-{time_raw[1]:02x}-{time_raw[2]:02x} {time_raw[3]:02x}:{time_raw[4]:02x}:{time_raw[5]:02x} (UTC+8)"
 
                 print("  --- INFORMACIÓN DE POSICIÓN BÁSICA (0x0200) ---")
-                print(f"  - Lat/Lon: {latitude:.6f} ({status_data['Tipo Latitud']}) / {longitude:.6ff} ({status_data['Tipo Longitud']})")
+                # FIX: Corregido de 'longitude:.6ff' a 'longitude:.6f'
+                print(f"  - Lat/Lon: {latitude:.6f} ({status_data['Tipo Latitud']}) / {longitude:.6f} ({status_data['Tipo Longitud']})")
                 print(f"  - Estado: {status_data['Estado Posición']} | ACC: {status_data['Estado ACC']}")
                 print(f"  - Hora del Reporte: {time_str}")
                 
