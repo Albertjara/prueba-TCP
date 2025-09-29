@@ -170,11 +170,12 @@ def parse_status_bits(status_raw):
         "Valor RAW Completo": hex(status_int)
     }
 
-# --- Función para parsear sub-campos de la trama extendida 0xEB (CORREGIDA V4.1) ---
+# --- Función para parsear sub-campos de la trama extendida 0xEB (CORREGIDA V4.2) ---
 def parse_extended_eb_fields(additional_value):
     """
     Analiza la sub-trama extendida (ID 0xeb) utilizando la estructura L-ID-Valor.
-    CORRECCIÓN V4.1: Se asume que el ID Lógico es el primer byte del campo ID de 2 bytes (T1).
+    CORRECCIÓN V4.2: Se asume que la Longitud (L) y el ID (T) son Big-Endian (BE), 
+    y que la longitud L es la longitud total del bloque (ID + Valor).
     """
     sub_data = additional_value
     
@@ -191,25 +192,27 @@ def parse_extended_eb_fields(additional_value):
 
     while sub_current_byte < len(sub_data):
         
-        # 1. Leer Longitud del Bloque (2 bytes, LE)
+        # 1. Leer Longitud del Bloque (2 bytes, BE)
         if sub_current_byte + 2 > len(sub_data): 
-            print(f"      [AVISO] Datos insuficientes para leer la longitud del bloque. Posición: {sub_current_byte}. Rompiendo ciclo.")
+            print(f"      [AVISO] Datos insuficientes para leer la longitud total del bloque. Posición: {sub_current_byte}. Rompiendo ciclo.")
             break
             
-        # L: Longitud total del bloque (ID + Valor)
-        sub_length_block = int.from_bytes(sub_data[sub_current_byte:sub_current_byte+2], 'little')
+        # L: Longitud total del bloque (ID + Valor). Debe ser BE. (CORRECCIÓN V4.2)
+        sub_length_block = int.from_bytes(sub_data[sub_current_byte:sub_current_byte+2], 'big')
         
-        # 2. Leer ID del Bloque (2 bytes)
+        # 2. Leer ID del Bloque (2 bytes, BE)
         id_start = sub_current_byte + 2
         if id_start + 2 > len(sub_data): 
             print(f"      [AVISO] Datos insuficientes para leer el ID del bloque. Posición: {id_start}. Rompiendo ciclo.")
             break
             
         sub_id_raw_full = sub_data[id_start:id_start+2]
-        # T1 es el byte que coincide con el ID Lógico (0x89, 0xC5, 0x2D, etc.).
-        sub_id_int_1byte = sub_id_raw_full[0] 
+        
+        # El ID Lógico (ej: 0x89, 0xC5) es el segundo byte de los 2 bytes del ID de bloque (BE).
+        sub_id_int_1byte = sub_id_raw_full[1] # CORRECCIÓN V4.2: Usamos el segundo byte (index 1)
+        
         # Creamos el ID lógico completo para impresión/mapeo (ej: 0x0089)
-        logical_id_for_print = int.from_bytes(b'\x00' + sub_id_raw_full[0].to_bytes(1, 'big'), 'big')
+        logical_id_for_print = int.from_bytes(b'\x00' + sub_id_raw_full[1].to_bytes(1, 'big'), 'big')
         
         # 3. Calcular Longitud y Bytes del Valor
         value_start = id_start + 2
@@ -217,7 +220,7 @@ def parse_extended_eb_fields(additional_value):
         # La longitud del valor es la longitud del bloque (L) - 2 bytes de ID (T)
         value_length = sub_length_block - 2 
         
-        if value_length < 0 or sub_length_block == 0:
+        if value_length < 0 or sub_length_block < 2:
              print(f"      [ERROR] Longitud de valor calculada inválida ({value_length}) para el campo {hex(logical_id_for_print)}. Rompiendo ciclo.")
              break
         
@@ -229,6 +232,7 @@ def parse_extended_eb_fields(additional_value):
             
         sub_value_bytes = sub_data[value_start:value_end]
         
+        # La impresión muestra el ID de 2 bytes (ej: 00a8) y la longitud (ej: 1)
         print(f"      > Campo ID (Proprietario RAW): {sub_id_raw_full.hex()} | ID Lógico Mapeado: {hex(logical_id_for_print)} | Longitud Valor: {value_length} bytes | HEX: {sub_value_bytes.hex()}")
 
         # Mapeamos los IDs LÓGICOS (usando el valor del byte T1: 0x89, 0xC5, etc.)
@@ -269,15 +273,18 @@ def parse_extended_eb_fields(additional_value):
                 print(f"          > Estado de Vibración (Bit 6): {vibration_status}")
 
         elif sub_id_int_1byte == 0x2D: # Voltaje del Dispositivo (2 bytes, mV)
+            # El campo ID 0x2D requiere 2 bytes de valor (L=4).
             if value_length == 2:
                 # El valor del voltaje se lee como BE (Alto primero)
                 voltage_mv = int.from_bytes(sub_value_bytes, 'big') 
                 voltage_v = voltage_mv / 1000.0
+                # El ejemplo de protocolo usa 36B0 = 14000mV.
                 print(f"        -> **Voltaje (ID 0x002D)**: **{voltage_v:.3f} V** (RAW: {voltage_mv} mV)")
             else:
                  print(f"        -> **Voltaje (ID 0x002D)**: Longitud inesperada de {value_length} bytes.")
 
         elif sub_id_int_1byte == 0xA8: # Porcentaje de Batería (1 byte)
+            # El campo ID 0xA8 requiere 1 byte de valor (L=3).
             if value_length == 1:
                 percentage = sub_value_bytes[0]
                 print(f"        -> **Porcentaje de Batería (ID 0x00A8)**: **{percentage} %**")
@@ -302,9 +309,9 @@ def parse_extended_eb_fields(additional_value):
                     # Decodificar el resto como string ASCII
                     wifi_data_string = wifi_data_bytes.decode('ascii', errors='ignore').strip('\x00').strip()
                     
+                    # Split por coma y analizar pares MAC,RSSI
                     wifi_entries = wifi_data_string.split(',')
                     
-                    # Se asume que son pares (MAC, RSSI)
                     print(f"        -> **Redes Wi-Fi Encontradas (ID 0x00B9)** (Contador reportado: {count}, Pares analizados: {len(wifi_entries)//2}):")
                     for i in range(0, len(wifi_entries), 2):
                         if i + 1 < len(wifi_entries):
@@ -320,7 +327,12 @@ def parse_extended_eb_fields(additional_value):
         else:
             print(f"        -> ID {hex(logical_id_for_print)} (No Mapeado): {sub_value_bytes.hex()}")
         
-        sub_current_byte = value_end
+        # Avanzar al inicio del siguiente bloque: 2 bytes L + L bytes V
+        # sub_current_byte = sub_current_byte + sub_length_block + 2 # L + L_bytes (2)
+
+        # Corregir el avance: la longitud del bloque L YA incluye el ID (2 bytes) y el valor. 
+        # El avance es 2 bytes (L) + L (ID + Value)
+        sub_current_byte = sub_current_byte + 2 + sub_length_block
         
     print("    - FIN DE DECODIFICACIÓN DETALLADA DE 0xEB.")
 
