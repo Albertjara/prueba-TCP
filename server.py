@@ -236,11 +236,14 @@ def handle_client(conn, addr):
         while True:
             data = conn.recv(2048) 
             if not data: break
+
+            # Print the raw hex frame as soon as it's received
+            print(f"  -> [TRAMA CRUDA de {addr}] {data.hex()}")
             
             processed_data = unescape_jt808(data)
             
             if not processed_data or len(processed_data) < 13: 
-                print(f"  [WARNING] Incomplete or empty data received.")
+                print(f"  [WARNING] Incomplete or empty data received after unescaping.")
                 continue
                 
             checksum_received = processed_data[-1]
