@@ -10,21 +10,44 @@ import logging
 
 # --- Configuration and Constants ---
 HOST = '0.0.0.0'
-# ==============================================================================
-# CORRECCIÓN DEFINITIVA: Puertos internos FIJOS que no cambiarán.
-# ==============================================================================
-# El servidor TCP para los dispositivos GPS escuchará SIEMPRE en el puerto 7000.
 TCP_PORT = 7000
-# La API web escuchará SIEMPRE en el puerto 8080.
 API_PORT = 8080
-
 TIMEOUT_IN_SECONDS = 30 * 60 
 
 # --- Diccionario de Clientes y Lock ---
 connected_clients = {}
 clients_lock = threading.Lock()
+server_serial_counter = 0
+serial_lock = threading.Lock()
+
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
+
+# ==============================================================================
+# NUEVO: Diccionario "Traductor" de Comandos
+# Mapea un comando de texto simple a su ID de mensaje y cuerpo en formato JT/T 808.
+# El Message ID 8103 es un estándar para "Establecer Parámetros", usado comúnmente para comandos propietarios.
+# El cuerpo del comando es simplemente el texto convertido a hexadecimal.
+# ==============================================================================
+COMMAND_MAP = {
+    '<CKWF>': {
+        'message_id_hex': '8103',
+        'command_body_hex': '<CKWF>'.encode('ascii').hex()
+    },
+    '<SPBSJ*P:BSJGPS*XC:1>': {
+        'message_id_hex': '8103',
+        'command_body_hex': '<SPBSJ*P:BSJGPS*XC:1>'.encode('ascii').hex()
+    },
+    '<SPBSJ*P:BSJGPS*XC:0>': {
+        'message_id_hex': '8103',
+        'command_body_hex': '<SPBSJ*P:BSJGPS*XC:0>'.encode('ascii').hex()
+    },
+    'REINICIAR': {
+        'message_id_hex': '8105', # ID de mensaje estándar para "Control del Terminal"
+        'command_body_hex': '01'      # Cuerpo estándar para la acción "Reiniciar"
+    }
+}
+
 
 # --- LÓGICA DE PARSING Y UTILIDADES JT/T 808 (DE TU CÓDIGO ORIGINAL) ---
 
@@ -159,8 +182,6 @@ def parse_jt808_position_report(payload_for_checksum):
     output.append(f"  --- END OF 0x0200 FRAME PARSING ---")
     return "\n".join(output)
 
-# --- Lógica del Servidor TCP ---
-
 def send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id_original):
     response_message_id = 0x8001
     response_result = 0x00
@@ -234,7 +255,7 @@ def handle_client(conn, addr):
                      send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
 
             except Exception:
-                pass # Ignorar tramas que no son JT/T 808 (probablemente respuestas a comandos)
+                pass 
     finally:
         if terminal_id:
             with clients_lock:
@@ -253,23 +274,59 @@ def start_tcp_server():
         conn, addr = server_socket.accept()
         threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
-# --- Lógica de la API Web Flask ---
 app = Flask(__name__)
 
+# ==============================================================================
+# API SIMPLIFICADA CON TRADUCTOR AUTOMÁTICO
+# ==============================================================================
 @app.route('/send_command', methods=['GET'])
 def send_command():
+    global server_serial_counter
     device_id = request.args.get('device_id')
-    command_str = request.args.get('command')
-    if not device_id or not command_str:
-        return jsonify({"status": "error", "message": "Faltan parámetros."}), 400
+    command_text = request.args.get('command')
+
+    if not device_id or not command_text:
+        return jsonify({"status": "error", "message": "Faltan 'device_id' o 'command'."}), 400
+
+    # Buscar el comando en nuestro diccionario "traductor"
+    command_data = COMMAND_MAP.get(command_text)
+    if not command_data:
+        return jsonify({
+            "status": "error",
+            "message": f"Comando '{command_text}' no reconocido.",
+            "available_commands": list(COMMAND_MAP.keys())
+        }), 404
+    
+    # Obtener los datos pre-configurados del diccionario
+    message_id_hex = command_data['message_id_hex']
+    command_body_hex = command_data['command_body_hex']
+    
+    try:
+        message_id = int(message_id_hex, 16)
+        command_body = bytes.fromhex(command_body_hex)
+        terminal_id_raw = bytes.fromhex(device_id)
+    except ValueError:
+        return jsonify({"status": "error", "message": "Error interno en la conversión a hexadecimal."}), 500
+    
     with clients_lock:
         client_conn = connected_clients.get(device_id)
         if client_conn:
             try:
-                command_to_send = command_str + '\r\n'
-                client_conn.sendall(command_to_send.encode('latin-1'))
-                print(f"\n[API] Comando '{command_str}' enviado a {device_id} con terminador \\r\\n.")
-                return jsonify({"status": "success", "message": f"Comando enviado."})
+                with serial_lock:
+                    server_serial_counter += 1
+                    current_serial = server_serial_counter
+                
+                serial_raw = current_serial.to_bytes(2, 'big')
+                
+                packet_to_send, packet_hex = create_jt808_packet(message_id, terminal_id_raw, serial_raw, command_body)
+                
+                client_conn.sendall(packet_to_send)
+                print(f"\n[API] Comando '{command_text}' traducido y enviado a {device_id}. Trama: {packet_hex}")
+                return jsonify({
+                    "status": "success", 
+                    "message": f"Comando '{command_text}' enviado.",
+                    "frame_sent_hex": packet_hex
+                })
             except Exception as e:
                 return jsonify({"status": "error", "message": str(e)}), 500
         else:
@@ -279,14 +336,10 @@ def send_command():
                 "connected_devices": list(connected_clients.keys())
             }), 404
 
-# --- Punto de inicio del programa ---
 if __name__ == "__main__":
-    # 1. Iniciar el servidor TCP en un hilo secundario (background).
     tcp_thread = threading.Thread(target=start_tcp_server, daemon=True)
     tcp_thread.start()
     
-    # 2. Iniciar el servidor Flask (API web) en el hilo principal.
-    #    Forzamos el uso del puerto API_PORT (8080), ignorando la variable $PORT de Railway.
     print(f"--- SERVIDOR API INICIADO en {HOST}:{API_PORT} ---")
     app.run(host=HOST, port=API_PORT)
 
