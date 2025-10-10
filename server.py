@@ -43,7 +43,15 @@ COMMAND_MAP = {
     },
     'SOLICITAR_APN': {
         'message_id_hex': '8104',
-        'command_body_hex': '000000010013'
+        'command_body_hex': '000000010013' # Cuerpo: 1 parámetro, ID del parámetro APN (0x0013)
+    },
+    # ## NUEVO COMANDO EXPERIMENTAL ##
+    # Este comando prueba la hipótesis de que el texto es el VALOR de un parámetro.
+    # Envía el texto '<SPBSJ*P:BSJGPS*XC:1>' como el valor del parámetro 0x0013 (Dirección del Servidor Principal)
+    'PROBAR_TEXTO_COMO_PARAMETRO': {
+        'message_id_hex': '8103', # ID para "Establecer Parámetros"
+        'command_body_hex': '01' + '00000013' + '15' + '<SPBSJ*P:BSJGPS*XC:1>'.encode('ascii').hex()
+        # Estructura: [Num Params: 1] + [ID Param: 0x0013] + [Longitud: 21 bytes = 0x15] + [Valor]
     }
 }
 
@@ -180,7 +188,6 @@ def parse_jt808_position_report(payload_for_checksum):
     output.append(f"  --- END OF 0x0200 FRAME PARSING ---")
     return "\n".join(output)
 
-# ## NUEVO: Función para decodificar la respuesta a la consulta de parámetros ##
 def parse_jt808_parameter_response(message_body):
     """Decodifica el cuerpo de un mensaje 0x0104 (Respuesta a Consulta de Parámetros)."""
     output = ["    -> [Message 0x0104] Respuesta a Consulta de Parámetros RECIBIDA."]
@@ -299,7 +306,6 @@ def handle_client(conn, addr):
                     else:
                         print(f"       [WARN] El cuerpo de la respuesta es demasiado corto para ser decodificado: {message_body.hex()}")
                 
-                # ## MANEJO DEL NUEVO MENSAJE 0x0104 ##
                 elif message_id == 0x0104:
                     decoded_params = parse_jt808_parameter_response(message_body)
                     print(decoded_params)
