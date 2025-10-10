@@ -11,11 +11,12 @@ import logging
 # --- Configuration and Constants ---
 HOST = '0.0.0.0'
 # ==============================================================================
-# CORRECCIÓN: Cambiamos el puerto por defecto del TCP a 5433 para evitar conflictos
+# CORRECCIÓN FINAL: Asignamos un puerto único y fijo para el servidor TCP
+# que no entre en conflicto con el puerto que Railway asigna a la API.
 # ==============================================================================
-TCP_PORT = int(os.environ.get('TCP_PORT', 5433))
+TCP_PORT = int(os.environ.get('TCP_PORT', 6000))
 
-# El puerto para la API web. Usamos la variable 'PORT' que Railway nos da para el servicio web.
+# El puerto para la API web. Usamos la variable 'PORT' que Railway nos da.
 API_PORT = int(os.environ.get('PORT', 8080))
 TIMEOUT_IN_SECONDS = 30 * 60 
 
