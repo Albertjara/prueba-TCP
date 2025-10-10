@@ -1,3 +1,1 @@
-gunicorn
-# Si usas alguna librería adicional para analizar tus datos (ej: pandas, numpy, requests),
-# agrégala aquí, una por línea. Por ahora, solo necesitamos gunicorn.
+Flask
