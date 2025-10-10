@@ -6,77 +6,71 @@ from datetime import datetime
 import random 
 import struct
 
+## ===============================================================
+## NUEVO: Importamos Flask para la API y un Lock para seguridad
+## ===============================================================
+from flask import Flask, request, jsonify
+import logging
+
 # --- Configuration and Constants ---
-# The server will listen on all interfaces (0.0.0.0)
 HOST = '0.0.0.0'
-# The default port is 5432, configurable via the 'PORT' environment variable
 PORT = int(os.environ.get('PORT', 5432))
-# Timeout before closing an inactive connection (30 minutes)
+# Puerto para nuestra nueva API. Railway lo expondrá automáticamente.
+API_PORT = int(os.environ.get('API_PORT', 8080)) 
 TIMEOUT_IN_SECONDS = 30 * 60 
 
-# --- Utilities and Base Protocol ---
+## ===============================================================
+## NUEVO: La "Libreta" para guardar nuestros dispositivos conectados
+## ===============================================================
+# Este diccionario guardará: {'id_del_dispositivo': objeto_de_conexion}
+connected_clients = {}
+# Un "candado" para evitar problemas si dos hilos intentan modificar la libreta al mismo tiempo.
+clients_lock = threading.Lock()
+# Configuración para que la consola de Flask no se llene de mensajes informativos.
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
+
+# --- Utilities and Base Protocol --- (Lógica de tu archivo original)
 
 def unescape_jt808(data_bytes_with_delimiters):
-    """
-    Un-escapes the bytes of a JT/T 808 message (removes 0x7e and handles 0x7d).
-    This ensures that the checksum and payload parsing are correct.
-    """
     if data_bytes_with_delimiters.startswith(b'\x7e') and data_bytes_with_delimiters.endswith(b'\x7e'):
         data_to_unescape = data_bytes_with_delimiters[1:-1]
     else:
         data_to_unescape = data_bytes_with_delimiters
-    
     unescaped_bytes = bytearray()
     i = 0
     while i < len(data_to_unescape):
         if data_to_unescape[i] == 0x7d and i + 1 < len(data_to_unescape):
             next_byte = data_to_unescape[i+1]
-            if next_byte == 0x01: 
-                unescaped_bytes.append(0x7d)
-                i += 2
-            elif next_byte == 0x02: 
-                unescaped_bytes.append(0x7e)
-                i += 2
-            else: 
-                unescaped_bytes.append(data_to_unescape[i])
-                i += 1
-        else: 
-            unescaped_bytes.append(data_to_unescape[i])
-            i += 1
-            
+            if next_byte == 0x01: unescaped_bytes.append(0x7d); i += 2
+            elif next_byte == 0x02: unescaped_bytes.append(0x7e); i += 2
+            else: unescaped_bytes.append(data_to_unescape[i]); i += 1
+        else: unescaped_bytes.append(data_to_unescape[i]); i += 1
     return bytes(unescaped_bytes)
 
 def escape_jt808(data_bytes):
-    """Escapes the bytes of a JT/T 808 message for transmission (ACK)."""
     escaped = data_bytes.replace(b'\x7d', b'\x7d\x01')
     return b'\x7e' + escaped.replace(b'\x7e', b'\x7d\x02') + b'\x7e'
 
 def calculate_checksum(data):
-    """Calculates the XOR checksum of a byte sequence."""
     calculated_checksum = 0
-    for byte in data:
-        calculated_checksum ^= byte
+    for byte in data: calculated_checksum ^= byte
     return calculated_checksum
 
 def create_jt808_packet(message_id, terminal_phone_number_raw, serial_number_raw, body):
-    """Constructs a complete JT/T 808 packet (Used for ACK)."""
     body_length = len(body)
     message_body_attributes = (body_length & 0x03FF).to_bytes(2, 'big') 
-    
     header = message_id.to_bytes(2, 'big') + message_body_attributes + terminal_phone_number_raw + serial_number_raw
-    
     checksum_payload = header + body
-    
     calculated_checksum = calculate_checksum(checksum_payload)
-    
     raw_frame = checksum_payload + calculated_checksum.to_bytes(1, 'big')
     final_packet = escape_jt808(raw_frame)
     return final_packet, raw_frame.hex()
 
-# --- NEW 0x0200 PARSING LOGIC (from CODIGO 2) ---
+# --- PARSING LOGIC --- (TODA tu lógica de parsing original de server (2).py)
 
 def _parse_status_bits(raw_bytes):
-    """Decodes the 4 bytes of basic position status information."""
     status_dword = int.from_bytes(raw_bytes, 'big')
     lines = [f"  [{raw_bytes.hex()}] Status Information: ["]
     lines.append(f"    [bit0] ACC Status: {'ACC on' if (status_dword >> 0) & 1 else 'ACC off'}")
@@ -87,7 +81,6 @@ def _parse_status_bits(raw_bytes):
     return lines
 
 def _parse_extended_block(data_bytes):
-    """Parses an extended data block (ID 0xEB)."""
     lines = []
     idx = 0
     while idx < len(data_bytes):
@@ -99,16 +92,10 @@ def _parse_extended_block(data_bytes):
             idx += 2
             ext_data = data_bytes[idx:idx+(total_len-2)]
             idx += (total_len-2)
-
             lines.append(f"    [{ext_id_bytes.hex()}] Information ID")
-            if ext_id == 0x00b2:
-                iccid_string = ext_data.hex()
-                lines.append(f"    [{ext_data.hex()}] ICCID Number: {iccid_string}")
-            elif ext_id == 0x00a8:
-                lines.append(f"    [{ext_data.hex()}] Battery Level: {int.from_bytes(ext_data, 'big')}")
-            elif ext_id == 0x00d5:
-                imei_string = ext_data.decode('ascii', errors='ignore')
-                lines.append(f"    [{ext_data.hex()}] IMEI: {imei_string}")
+            if ext_id == 0x00b2: lines.append(f"    [{ext_data.hex()}] ICCID Number: {ext_data.hex()}")
+            elif ext_id == 0x00a8: lines.append(f"    [{ext_data.hex()}] Battery Level: {int.from_bytes(ext_data, 'big')}")
+            elif ext_id == 0x00d5: lines.append(f"    [{ext_data.hex()}] IMEI: {ext_data.decode('ascii', errors='ignore')}")
             elif ext_id == 0x00b9:
                 lines.append(f"    [{ext_id_bytes.hex()}] Wi-Fi Hotspot Information ID")
                 num_hotspots = ext_data[0]
@@ -117,18 +104,15 @@ def _parse_extended_block(data_bytes):
                 lines.append(f"    [{ext_data.hex()}]:[")
                 lines.append(f"      Number of items: {num_hotspots},")
                 lines.append(f"      Item data:")
-                for spot in hotspots:
-                    lines.append(f"      {spot}")
+                for spot in hotspots: lines.append(f"      {spot}")
                 lines.append("    ]")
-            else:
-                 lines.append(f"    [{ext_data.hex()}] Unknown extended data,")
+            else: lines.append(f"    [{ext_data.hex()}] Unknown extended data,")
         except IndexError:
             lines.append("    [ERROR] Malformed extended block (0xEB).")
             break
     return lines
 
 def _parse_additional_info(raw_bytes):
-    """Parses the list of additional information using a TLV approach."""
     lines = [f"  [{raw_bytes.hex()}] Location Additional Information List: ["]
     idx = 0
     while idx < len(raw_bytes):
@@ -136,26 +120,17 @@ def _parse_additional_info(raw_bytes):
             info_id = raw_bytes[idx]; idx += 1
             info_len = raw_bytes[idx]; idx += 1
             info_value = raw_bytes[idx:idx + info_len]; idx += info_len
-            
             lines.append(f"    [0x{info_id:02x}] Information ID")
-            if info_id == 0x01:
-                lines.append(f"    [{info_value.hex()}] Mileage (km): {int.from_bytes(info_value, 'big')/10.0},")
-            elif info_id == 0x30:
-                lines.append(f"    [{info_value.hex()}] Network Signal Strength: {int.from_bytes(info_value, 'big')},")
-            elif info_id == 0x31:
-                lines.append(f"    [{info_value.hex()}] Number of GSNN positioning satellites: {int.from_bytes(info_value, 'big')},")
+            if info_id == 0x01: lines.append(f"    [{info_value.hex()}] Mileage (km): {int.from_bytes(info_value, 'big')/10.0},")
+            elif info_id == 0x30: lines.append(f"    [{info_value.hex()}] Network Signal Strength: {int.from_bytes(info_value, 'big')},")
+            elif info_id == 0x31: lines.append(f"    [{info_value.hex()}] Number of GSNN positioning satellites: {int.from_bytes(info_value, 'big')},")
             elif info_id == 0x33:
-                modes = {
-                    1: "Ultra-long duration mode",
-                    4: "Intelligent power saving mode at resident point"
-                }
+                modes = {1: "Ultra-long duration mode", 4: "Intelligent power saving mode at resident point"}
                 mode_id = int.from_bytes(info_value, 'big')
                 mode_desc = modes.get(mode_id, f"Unknown Mode ({mode_id})")
                 lines.append(f"    [{info_value.hex()}] Device Mode: {mode_desc},")
-            elif info_id == 0xeb:
-                 lines.extend(_parse_extended_block(info_value))
-            else:
-                 lines.append(f"    [{info_value.hex()}] Unknown data,")
+            elif info_id == 0xeb: lines.extend(_parse_extended_block(info_value))
+            else: lines.append(f"    [{info_value.hex()}] Unknown data,")
         except IndexError:
             lines.append("    [ERROR] Malformed additional information. Stopping parse.")
             break
@@ -163,165 +138,187 @@ def _parse_additional_info(raw_bytes):
     return lines
 
 def parse_jt808_position_report(payload_for_checksum):
-    """Decodes the body of the position report (0x0200) and its header."""
-    
     message_body = payload_for_checksum[12:]
     body_length = len(message_body)
-    
-    if body_length < 28:
-        return "  [ERROR] Message body 0x0200 is too short."
-
+    if body_length < 28: return "  [ERROR] Message body 0x0200 is too short."
     output = []
     try:
         idx = 0
-        
         output.append(f"  --- BASIC POSITION DATA (BODY) ---")
-        
-        raw_bytes = message_body[idx:idx+4]; idx += 4
-        output.append(f"  [{raw_bytes.hex()}] Alarm Indicator: []")
-        
-        raw_bytes = message_body[idx:idx+4]; idx += 4
-        output.extend(_parse_status_bits(raw_bytes))
-        
-        raw_bytes = message_body[idx:idx+4]; idx += 4
-        output.append(f"  [{raw_bytes.hex()}] Latitude: {int.from_bytes(raw_bytes, 'big') / 1000000.0}")
-        
-        raw_bytes = message_body[idx:idx+4]; idx += 4
-        output.append(f"  [{raw_bytes.hex()}] Longitude: {int.from_bytes(raw_bytes, 'big') / 1000000.0}")
-        
-        raw_bytes = message_body[idx:idx+2]; idx += 2
-        output.append(f"  [{raw_bytes.hex()}] Altitude: {int.from_bytes(raw_bytes, 'big') / 10.0}")
-        
-        raw_bytes = message_body[idx:idx+2]; idx += 2
-        output.append(f"  [{raw_bytes.hex()}] Speed: {int.from_bytes(raw_bytes, 'big') / 10.0}")
-        
-        raw_bytes = message_body[idx:idx+2]; idx += 2
-        output.append(f"  [{raw_bytes.hex()}] Direction: {int.from_bytes(raw_bytes, 'big')}")
-        
+        raw_bytes = message_body[idx:idx+4]; idx += 4; output.append(f"  [{raw_bytes.hex()}] Alarm Indicator: []")
+        raw_bytes = message_body[idx:idx+4]; idx += 4; output.extend(_parse_status_bits(raw_bytes))
+        raw_bytes = message_body[idx:idx+4]; idx += 4; output.append(f"  [{raw_bytes.hex()}] Latitude: {int.from_bytes(raw_bytes, 'big') / 1000000.0}")
+        raw_bytes = message_body[idx:idx+4]; idx += 4; output.append(f"  [{raw_bytes.hex()}] Longitude: {int.from_bytes(raw_bytes, 'big') / 1000000.0}")
+        raw_bytes = message_body[idx:idx+2]; idx += 2; output.append(f"  [{raw_bytes.hex()}] Altitude: {int.from_bytes(raw_bytes, 'big') / 10.0}")
+        raw_bytes = message_body[idx:idx+2]; idx += 2; output.append(f"  [{raw_bytes.hex()}] Speed: {int.from_bytes(raw_bytes, 'big') / 10.0}")
+        raw_bytes = message_body[idx:idx+2]; idx += 2; output.append(f"  [{raw_bytes.hex()}] Direction: {int.from_bytes(raw_bytes, 'big')}")
         raw_bytes = message_body[idx:idx+6]; idx += 6
         time_val = datetime.strptime(raw_bytes.hex(), '%y%m%d%H%M%S').strftime('%Y-%m-%d %H:%M:%S')
         output.append(f"  [{raw_bytes.hex()}] Terminal Time: {time_val}")
-        
         if body_length > idx:
             additional_bytes = message_body[idx:]
             output.append(f"\n  --- ADDITIONAL BODY INFORMATION (TLV) ---")
             output.extend(_parse_additional_info(additional_bytes))
         else:
             output.append(f"\n  --- NO ADDITIONAL INFORMATION ---")
-
     except (struct.error, ValueError, IndexError) as e:
         return f"  [ERROR] Failed to decode basic position fields: {e}"
-
     output.append(f"  --- END OF 0x0200 FRAME PARSING ---")
     return "\n".join(output)
 
 # --- TCP Server Logic ---
 
 def send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id_original):
-    """Constructs and sends the Universal ACK 0x8001."""
     response_message_id = 0x8001
-    response_result = 0x00 # Success
+    response_result = 0x00
     response_body = message_serial_number_raw + message_id_original.to_bytes(2, 'big') + response_result.to_bytes(1, 'big')
-    
     final_response, _ = create_jt808_packet(response_message_id, terminal_phone_number_raw, message_serial_number_raw, response_body)
     conn.sendall(final_response)
     print(f"    <- [ACK {hex(response_message_id)}] Sent response to Serial {int.from_bytes(message_serial_number_raw, 'big')} (Target: {hex(message_id_original)}).")
 
 def handle_client(conn, addr):
-    """Handles the client connection, implementing ACKs for major messages."""
     print(f"[NEW CONNECTION] Client {addr} connected.")
     conn.settimeout(TIMEOUT_IN_SECONDS)
-
+    terminal_id = None 
     try:
         while True:
             data = conn.recv(2048) 
             if not data: break
 
-            # Print the raw hex frame as soon as it's received
-            print(f"  -> [TRAMA CRUDA de {addr}] {data.hex()}")
+            print(f"  -> [TRAMA CRUDA de {addr}] {data.hex()} (ASCII: {str(data, 'latin-1', errors='ignore')})")
             
-            processed_data = unescape_jt808(data)
-            
-            if not processed_data or len(processed_data) < 13: 
-                print(f"  [WARNING] Incomplete or empty data received after unescaping.")
-                continue
+            try:
+                processed_data = unescape_jt808(data)
                 
-            checksum_received = processed_data[-1]
-            payload_for_checksum = processed_data[:-1]
-            calculated_checksum = calculate_checksum(payload_for_checksum)
-            
-            if calculated_checksum != checksum_received:
-                print(f"  [ERROR] INCORRECT Checksum. Calculated: {hex(calculated_checksum)}, Received: {hex(checksum_received)}. Discarding message.")
-                continue
-
-            message_id = int.from_bytes(payload_for_checksum[0:2], 'big')
-            message_serial_number = int.from_bytes(payload_for_checksum[10:12], 'big')
-            terminal_phone_number_raw = payload_for_checksum[4:10]
-            message_serial_number_raw = payload_for_checksum[10:12]
-            
-            print(f"\n[DATA RECEIVED from {addr}] (ID: {hex(message_id)}, Serial: {message_serial_number})")
-            
-            if message_id == 0x0100: # TERMINAL REGISTRATION
-                auth_code = f"AUTH-{random.randint(1000, 9999)}" 
-                auth_code_bytes = auth_code.encode('gbk')
-                response_message_id = 0x8100
-                response_result = 0x00
-                response_body = message_serial_number_raw + response_result.to_bytes(1, 'big') + auth_code_bytes
+                if not processed_data or len(processed_data) < 13: 
+                    print(f"  [INFO] La trama no parece ser un mensaje JT/T 808 estándar.")
+                    continue
+                    
+                checksum_received = processed_data[-1]
+                payload_for_checksum = processed_data[:-1]
+                calculated_checksum = calculate_checksum(payload_for_checksum)
                 
-                final_response, _ = create_jt808_packet(response_message_id, terminal_phone_number_raw, message_serial_number_raw, response_body)
-                conn.sendall(final_response)
+                if calculated_checksum != checksum_received:
+                    print(f"  [ERROR] Checksum INCORRECTO. Descartando mensaje.")
+                    continue
+
+                message_id = int.from_bytes(payload_for_checksum[0:2], 'big')
+                message_serial_number = int.from_bytes(payload_for_checksum[10:12], 'big')
+                terminal_phone_number_raw = payload_for_checksum[4:10]
+                message_serial_number_raw = payload_for_checksum[10:12]
                 
-                print(f"    <- [ACK {hex(response_message_id)}] Sent successful registration response to Serial {message_serial_number}.")
-                print(f"       Assigned Authentication Code: {auth_code}")
-
-            elif message_id == 0x0200: # POSITION REPORT
-                decoded_report = parse_jt808_position_report(payload_for_checksum)
-                print(decoded_report)
-                send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
-            
-            elif message_id == 0x0002: # HEARTBEAT
-                print("    -> [Message 0x0002] Heartbeat received.")
-                send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
-
-            elif message_id == 0x0003: # TERMINAL DEREGISTRATION (LOGOUT)
-                print("    -> [Message 0x0003] Logout Request received.")
-                send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
-                time.sleep(0.5)
-                break 
-
-            else:
-                 print(f"    -> [Message {hex(message_id)}] Unhandled (Generic) message received.")
-                 send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
+                current_terminal_id = terminal_phone_number_raw.hex()
+                if terminal_id != current_terminal_id:
+                    terminal_id = current_terminal_id
+                    with clients_lock:
+                        connected_clients[terminal_id] = conn
+                    print(f"    [INFO] Dispositivo '{terminal_id}' registrado en la libreta de clientes activos.")
+                
+                print(f"\n[DATA JT/T 808 RECEIVED from {addr}] (ID: {hex(message_id)}, Serial: {message_serial_number}, Device: {terminal_id})")
+                
+                if message_id == 0x0100:
+                    auth_code = f"AUTH-{random.randint(1000, 9999)}" 
+                    auth_code_bytes = auth_code.encode('gbk')
+                    response_message_id = 0x8100
+                    response_result = 0x00
+                    response_body = message_serial_number_raw + response_result.to_bytes(1, 'big') + auth_code_bytes
+                    final_response, _ = create_jt808_packet(response_message_id, terminal_phone_number_raw, message_serial_number_raw, response_body)
+                    conn.sendall(final_response)
+                    print(f"    <- [ACK {hex(response_message_id)}] Sent successful registration response to Serial {message_serial_number}.")
+                    print(f"       Assigned Authentication Code: {auth_code}")
+                elif message_id == 0x0200:
+                    decoded_report = parse_jt808_position_report(payload_for_checksum)
+                    print(decoded_report)
+                    send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
+                elif message_id == 0x0002:
+                    print("    -> [Message 0x0002] Heartbeat recibido.")
+                    send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
+                elif message_id == 0x0003:
+                    print("    -> [Message 0x0003] Logout Request recibido.")
+                    send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
+                    time.sleep(0.5)
+                    break 
+                else:
+                    print(f"    -> [Message {hex(message_id)}] Mensaje no manejado recibido.")
+                    send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
+            except Exception:
+                print(f"  [INFO] No se pudo procesar como JT/T 808. Probablemente es una respuesta a un comando.")
 
     except socket.timeout:
-        print(f"[TIMEOUT] Client {addr} inactive. Closing connection.")
+        print(f"[TIMEOUT] Cliente {addr} inactivo. Cerrando conexión.")
     except Exception as e:
         print(f"[UNEXPECTED ERROR ON CLIENT {addr}] {e}")
     finally:
+        if terminal_id:
+            with clients_lock:
+                if terminal_id in connected_clients:
+                    del connected_clients[terminal_id]
+                    print(f"    [INFO] Dispositivo '{terminal_id}' eliminado de la libreta.")
         conn.close()
         print(f"[CONNECTION CLOSED] Client {addr}")
 
 def start_server():
-    """Starts the main TCP server to listen for incoming connections."""
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
     try:
         server_socket.bind((HOST, PORT))
         server_socket.listen(5)
-        print(f"--- SERVER STARTED ---")
-        print(f"Listening for JT/T 808 frames on TCP {HOST}:{PORT}")
-        print(f"Detailed parsing will be shown for ID 0x0200 (Position Report).\n")
+        print(f"--- SERVIDOR TCP INICIADO ---")
+        print(f"Escuchando tramas JT/T 808 en {HOST}:{PORT}")
         
         while True:
             conn, addr = server_socket.accept()
-            threading.Thread(target=handle_client, args=(conn, addr)).start()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
             
     except Exception as e:
         print(f"[CRITICAL SERVER ERROR] Main server failed: {e}")
     finally:
         if 'server_socket' in locals():
             server_socket.close()
+            
+## ===============================================================
+## NUEVO: La sección de la API para enviar comandos
+## ===============================================================
+app = Flask(__name__)
 
+@app.route('/send_command', methods=['GET'])
+def send_command():
+    device_id = request.args.get('device_id')
+    command_str = request.args.get('command')
+
+    if not device_id or not command_str:
+        return jsonify({"status": "error", "message": "Faltan los parámetros 'device_id' o 'command'."}), 400
+
+    with clients_lock:
+        client_conn = connected_clients.get(device_id)
+        if client_conn:
+            try:
+                client_conn.sendall(command_str.encode('latin-1'))
+                print(f"\n[API] Comando '{command_str}' enviado al dispositivo {device_id}")
+                return jsonify({"status": "success", "message": f"Comando enviado a {device_id}."})
+            except Exception as e:
+                print(f"[API ERROR] Fallo al enviar comando a {device_id}: {e}")
+                return jsonify({"status": "error", "message": f"Fallo al enviar comando: {e}"}), 500
+        else:
+            print(f"[API] Dispositivo {device_id} no encontrado en la lista de clientes conectados.")
+            return jsonify({
+                "status": "error", 
+                "message": "Dispositivo no encontrado o no conectado.",
+                "connected_devices": list(connected_clients.keys())
+            }), 404
+
+def run_api_server():
+    """Inicia el servidor Flask."""
+    print(f"--- SERVIDOR API INICIADO ---")
+    print(f"Para enviar comandos, visita http://<tu_url_de_railway>/send_command?device_id=...&command=...")
+    app.run(host='0.0.0.0', port=API_PORT)
+
+## ===============================================================
+## MODIFICADO: El punto de inicio del programa
+## ===============================================================
 if __name__ == "__main__":
+    api_thread = threading.Thread(target=run_api_server, daemon=True)
+    api_thread.start()
+    
     start_server()
