@@ -23,12 +23,7 @@ serial_lock = threading.Lock()
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
-# ==============================================================================
-# NUEVO: Diccionario "Traductor" de Comandos
-# Mapea un comando de texto simple a su ID de mensaje y cuerpo en formato JT/T 808.
-# El Message ID 8103 es un estándar para "Establecer Parámetros", usado comúnmente para comandos propietarios.
-# El cuerpo del comando es simplemente el texto convertido a hexadecimal.
-# ==============================================================================
+# --- Diccionario "Traductor" de Comandos ---
 COMMAND_MAP = {
     '<CKWF>': {
         'message_id_hex': '8103',
@@ -43,13 +38,12 @@ COMMAND_MAP = {
         'command_body_hex': '<SPBSJ*P:BSJGPS*XC:0>'.encode('ascii').hex()
     },
     'REINICIAR': {
-        'message_id_hex': '8105', # ID de mensaje estándar para "Control del Terminal"
-        'command_body_hex': '01'      # Cuerpo estándar para la acción "Reiniciar"
+        'message_id_hex': '8105',
+        'command_body_hex': '01'
     }
 }
 
-
-# --- LÓGICA DE PARSING Y UTILIDADES JT/T 808 (DE TU CÓDIGO ORIGINAL) ---
+# --- LÓGICA DE PARSING Y UTILIDADES JT/T 808 ---
 
 def unescape_jt808(data_bytes_with_delimiters):
     if data_bytes_with_delimiters.startswith(b'\x7e') and data_bytes_with_delimiters.endswith(b'\x7e'):
@@ -199,9 +193,14 @@ def handle_client(conn, addr):
             data = conn.recv(2080) 
             if not data: break
             print(f"  -> [TRAMA CRUDA de {addr}] {data.hex()} (ASCII: {str(data, 'latin-1', errors='ignore')})")
+            
+            # ## CORRECCIÓN 1: No silenciar errores. Procesaremos todo lo que llegue. ##
+            # El bloque try/except se mantiene para evitar que un error en una trama detenga todo el hilo.
             try:
                 processed_data = unescape_jt808(data)
-                if not processed_data or len(processed_data) < 13: continue
+                if not processed_data or len(processed_data) < 13:
+                    print("     [WARN] Trama demasiado corta para ser un mensaje JT/T 808 válido.")
+                    continue
                 
                 checksum_received = processed_data[-1]
                 payload_for_checksum = processed_data[:-1]
@@ -224,6 +223,8 @@ def handle_client(conn, addr):
                 
                 print(f"\n[DATA RECEIVED from {addr}] (ID: {hex(message_id)}, Serial: {message_serial_number})")
                 
+                message_body = payload_for_checksum[12:]
+
                 if message_id == 0x0100:
                     auth_code = f"AUTH-{random.randint(1000, 9999)}" 
                     auth_code_bytes = auth_code.encode('gbk')
@@ -248,14 +249,32 @@ def handle_client(conn, addr):
                     print("    -> [Message 0x0003] Logout Request recibido.")
                     send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
                     time.sleep(0.5)
-                    break 
-
+                    break
+                
+                # ## CORRECCIÓN 2: Añadir lógica para manejar y decodificar la respuesta 0x0001 ##
+                elif message_id == 0x0001:
+                    print("    -> [Message 0x0001] Respuesta Universal del Dispositivo RECIBIDA.")
+                    if len(message_body) >= 5:
+                        response_serial = int.from_bytes(message_body[0:2], 'big')
+                        response_id = hex(int.from_bytes(message_body[2:4], 'big'))
+                        result_code = int.from_bytes(message_body[4:5], 'big')
+                        results = {0: "Éxito", 1: "Fallo", 2: "Mensaje erróneo", 3: "No soportado"}
+                        
+                        print(f"       [INFO] Respondiendo al serial del servidor: {response_serial}")
+                        print(f"       [INFO] Respondiendo al comando: {response_id}")
+                        print(f"       [INFO] Resultado: {result_code} ({results.get(result_code, 'Desconocido')})")
+                    else:
+                        print(f"       [WARN] El cuerpo de la respuesta es demasiado corto para ser decodificado: {message_body.hex()}")
+                    # No necesitamos enviar un ACK a un ACK.
+                
                 else:
                      print(f"    -> [Message {hex(message_id)}] Mensaje no manejado recibido.")
                      send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
 
-            except Exception:
-                pass 
+            except Exception as e:
+                # El except ahora imprimirá el error en lugar de quedarse en silencio.
+                print(f"     [ERROR] No se pudo procesar la trama. Causa: {e}")
+
     finally:
         if terminal_id:
             with clients_lock:
@@ -276,9 +295,6 @@ def start_tcp_server():
 
 app = Flask(__name__)
 
-# ==============================================================================
-# API SIMPLIFICADA CON TRADUCTOR AUTOMÁTICO
-# ==============================================================================
 @app.route('/send_command', methods=['GET'])
 def send_command():
     global server_serial_counter
@@ -288,7 +304,6 @@ def send_command():
     if not device_id or not command_text:
         return jsonify({"status": "error", "message": "Faltan 'device_id' o 'command'."}), 400
 
-    # Buscar el comando en nuestro diccionario "traductor"
     command_data = COMMAND_MAP.get(command_text)
     if not command_data:
         return jsonify({
@@ -297,7 +312,6 @@ def send_command():
             "available_commands": list(COMMAND_MAP.keys())
         }), 404
     
-    # Obtener los datos pre-configurados del diccionario
     message_id_hex = command_data['message_id_hex']
     command_body_hex = command_data['command_body_hex']
     
