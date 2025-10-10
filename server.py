@@ -10,14 +10,8 @@ import logging
 
 # --- Configuration and Constants ---
 HOST = '0.0.0.0'
-# ==============================================================================
-# CORRECCIÓN DEFINITIVA: Puertos internos FIJOS que no cambiarán.
-# ==============================================================================
-# El servidor TCP para los dispositivos GPS escuchará SIEMPRE en el puerto 7000.
 TCP_PORT = 7000
-# La API web escuchará SIEMPRE en el puerto 8080.
 API_PORT = 8080
-
 TIMEOUT_IN_SECONDS = 30 * 60 
 
 # --- Diccionario de Clientes y Lock ---
@@ -266,8 +260,12 @@ def send_command():
         client_conn = connected_clients.get(device_id)
         if client_conn:
             try:
-                client_conn.sendall(command_str.encode('latin-1'))
-                print(f"\n[API] Comando '{command_str}' enviado a {device_id}")
+                # =================================================================
+                # LA SOLUCIÓN: Añadimos \r\n para simular "presionar Enter"
+                # =================================================================
+                command_to_send = command_str + '\r\n'
+                client_conn.sendall(command_to_send.encode('latin-1'))
+                print(f"\n[API] Comando '{command_str}' enviado a {device_id} con terminador \\r\\n.")
                 return jsonify({"status": "success", "message": f"Comando enviado."})
             except Exception as e:
                 return jsonify({"status": "error", "message": str(e)}), 500
@@ -280,12 +278,9 @@ def send_command():
 
 # --- Punto de inicio del programa ---
 if __name__ == "__main__":
-    # 1. Iniciar el servidor TCP en un hilo secundario (background).
     tcp_thread = threading.Thread(target=start_tcp_server, daemon=True)
     tcp_thread.start()
     
-    # 2. Iniciar el servidor Flask (API web) en el hilo principal.
-    #    Usaremos SIEMPRE el puerto fijo API_PORT (8080). Railway lo detectará.
-    print(f"--- SERVIDOR API INICIADO en {HOST}:{API_PORT} ---")
-    app.run(host=HOST, port=API_PORT)
-
+    web_port = int(os.environ.get('PORT', API_PORT))
+    print(f"--- SERVIDOR API INICIADO en {HOST}:{web_port} ---")
+    app.run(host=HOST, port=web_port)
