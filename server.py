@@ -41,10 +41,9 @@ COMMAND_MAP = {
         'message_id_hex': '8105',
         'command_body_hex': '01'
     },
-    # ## NUEVO COMANDO AÑADIDO ##
     'SOLICITAR_APN': {
-        'message_id_hex': '8104', # ID estándar para "Consultar Parámetros"
-        'command_body_hex': '000000010013' # Cuerpo: 1 parámetro, ID del parámetro APN (0x0013)
+        'message_id_hex': '8104',
+        'command_body_hex': '000000010013'
     }
 }
 
@@ -181,6 +180,38 @@ def parse_jt808_position_report(payload_for_checksum):
     output.append(f"  --- END OF 0x0200 FRAME PARSING ---")
     return "\n".join(output)
 
+# ## NUEVO: Función para decodificar la respuesta a la consulta de parámetros ##
+def parse_jt808_parameter_response(message_body):
+    """Decodifica el cuerpo de un mensaje 0x0104 (Respuesta a Consulta de Parámetros)."""
+    output = ["    -> [Message 0x0104] Respuesta a Consulta de Parámetros RECIBIDA."]
+    try:
+        idx = 0
+        response_serial = int.from_bytes(message_body[idx:idx+2], 'big'); idx += 2
+        param_count = message_body[idx]; idx += 1
+        output.append(f"       [INFO] Respondiendo al serial del servidor: {response_serial}")
+        output.append(f"       [INFO] Número de parámetros en la respuesta: {param_count}")
+        
+        for i in range(param_count):
+            param_id = int.from_bytes(message_body[idx:idx+4], 'big'); idx += 4
+            param_len = message_body[idx]; idx += 1
+            param_value = message_body[idx:idx+param_len]; idx += param_len
+            
+            output.append(f"       - Parámetro ID: {hex(param_id)} ({param_id})")
+            try:
+                # Intentar decodificar como texto, que es lo más común para configuraciones
+                decoded_value = param_value.decode('ascii').strip('\x00')
+                output.append(f"         Valor (ASCII): '{decoded_value}'")
+            except UnicodeDecodeError:
+                # Si no es texto, mostrar el valor numérico y hexadecimal
+                numeric_value = int.from_bytes(param_value, 'big')
+                output.append(f"         Valor (Hex): {param_value.hex()}")
+                output.append(f"         Valor (Decimal): {numeric_value}")
+
+    except Exception as e:
+        output.append(f"       [ERROR] Fallo al decodificar la respuesta de parámetros: {e}")
+    
+    return "\n".join(output)
+
 def send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id_original):
     response_message_id = 0x8001
     response_result = 0x00
@@ -268,6 +299,12 @@ def handle_client(conn, addr):
                     else:
                         print(f"       [WARN] El cuerpo de la respuesta es demasiado corto para ser decodificado: {message_body.hex()}")
                 
+                # ## MANEJO DEL NUEVO MENSAJE 0x0104 ##
+                elif message_id == 0x0104:
+                    decoded_params = parse_jt808_parameter_response(message_body)
+                    print(decoded_params)
+                    send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
+
                 else:
                      print(f"    -> [Message {hex(message_id)}] Mensaje no manejado recibido. Se enviará ACK.")
                      send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
@@ -356,6 +393,3 @@ if __name__ == "__main__":
     
     print(f"--- SERVIDOR API INICIADO en {HOST}:{API_PORT} ---")
     app.run(host=HOST, port=API_PORT)
-
-
-
