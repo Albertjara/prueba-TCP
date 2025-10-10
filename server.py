@@ -388,4 +388,7 @@ if __name__ == "__main__":
     tcp_thread.start()
     
     print(f"--- SERVIDOR API INICIADO en {HOST}:{API_PORT} ---")
-    app.run(host=HOST, port=API_POT)
+    # --- CORRECCIÓN FINAL ---
+    # Se ha corregido el error de tipeo de API_POT a API_PORT
+    app.run(host=HOST, port=API_PORT)
+
