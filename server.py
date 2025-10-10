@@ -23,19 +23,20 @@ serial_lock = threading.Lock()
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
-# --- Diccionario "Traductor" de Comandos ---
+# --- Diccionario "Traductor" de Comandos (MODIFICADO) ---
+# Se han quitado los símbolos <> de los comandos de texto
 COMMAND_MAP = {
-    '<CKWF>': {
+    'CKWF': {
         'message_id_hex': '8103',
-        'command_body_hex': '<CKWF>'.encode('ascii').hex()
+        'command_body_hex': 'CKWF'.encode('ascii').hex()
     },
-    '<SPBSJ*P:BSJGPS*XC:1>': {
+    'SPBSJ*P:BSJGPS*XC:1': {
         'message_id_hex': '8103',
-        'command_body_hex': '<SPBSJ*P:BSJGPS*XC:1>'.encode('ascii').hex()
+        'command_body_hex': 'SPBSJ*P:BSJGPS*XC:1'.encode('ascii').hex()
     },
-    '<SPBSJ*P:BSJGPS*XC:0>': {
+    'SPBSJ*P:BSJGPS*XC:0': {
         'message_id_hex': '8103',
-        'command_body_hex': '<SPBSJ*P:BSJGPS*XC:0>'.encode('ascii').hex()
+        'command_body_hex': 'SPBSJ*P:BSJGPS*XC:0'.encode('ascii').hex()
     },
     'REINICIAR': {
         'message_id_hex': '8105',
@@ -43,15 +44,7 @@ COMMAND_MAP = {
     },
     'SOLICITAR_APN': {
         'message_id_hex': '8104',
-        'command_body_hex': '000000010013' # Cuerpo: 1 parámetro, ID del parámetro APN (0x0013)
-    },
-    # ## NUEVO COMANDO EXPERIMENTAL ##
-    # Este comando prueba la hipótesis de que el texto es el VALOR de un parámetro.
-    # Envía el texto '<SPBSJ*P:BSJGPS*XC:1>' como el valor del parámetro 0x0013 (Dirección del Servidor Principal)
-    'PROBAR_TEXTO_COMO_PARAMETRO': {
-        'message_id_hex': '8103', # ID para "Establecer Parámetros"
-        'command_body_hex': '01' + '00000013' + '15' + '<SPBSJ*P:BSJGPS*XC:1>'.encode('ascii').hex()
-        # Estructura: [Num Params: 1] + [ID Param: 0x0013] + [Longitud: 21 bytes = 0x15] + [Valor]
+        'command_body_hex': '000000010013'
     }
 }
 
@@ -189,7 +182,6 @@ def parse_jt808_position_report(payload_for_checksum):
     return "\n".join(output)
 
 def parse_jt808_parameter_response(message_body):
-    """Decodifica el cuerpo de un mensaje 0x0104 (Respuesta a Consulta de Parámetros)."""
     output = ["    -> [Message 0x0104] Respuesta a Consulta de Parámetros RECIBIDA."]
     try:
         idx = 0
@@ -205,11 +197,9 @@ def parse_jt808_parameter_response(message_body):
             
             output.append(f"       - Parámetro ID: {hex(param_id)} ({param_id})")
             try:
-                # Intentar decodificar como texto, que es lo más común para configuraciones
                 decoded_value = param_value.decode('ascii').strip('\x00')
                 output.append(f"         Valor (ASCII): '{decoded_value}'")
             except UnicodeDecodeError:
-                # Si no es texto, mostrar el valor numérico y hexadecimal
                 numeric_value = int.from_bytes(param_value, 'big')
                 output.append(f"         Valor (Hex): {param_value.hex()}")
                 output.append(f"         Valor (Decimal): {numeric_value}")
@@ -398,4 +388,4 @@ if __name__ == "__main__":
     tcp_thread.start()
     
     print(f"--- SERVIDOR API INICIADO en {HOST}:{API_PORT} ---")
-    app.run(host=HOST, port=API_PORT)
+    app.run(host=HOST, port=API_POT)
