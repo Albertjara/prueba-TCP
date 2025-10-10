@@ -11,13 +11,13 @@ import logging
 # --- Configuration and Constants ---
 HOST = '0.0.0.0'
 # ==============================================================================
-# CORRECCIÓN FINAL: Asignamos un puerto único y fijo para el servidor TCP
-# que no entre en conflicto con el puerto que Railway asigna a la API.
+# CORRECCIÓN FINAL: Asignamos puertos internos FIJOS para cada servicio.
 # ==============================================================================
-TCP_PORT = int(os.environ.get('TCP_PORT', 6000))
+# El servidor TCP para los dispositivos GPS escuchará SIEMPRE en el puerto 7000.
+TCP_PORT = 7000
+# La API web escuchará SIEMPRE en el puerto 8080.
+API_PORT = 8080
 
-# El puerto para la API web. Usamos la variable 'PORT' que Railway nos da.
-API_PORT = int(os.environ.get('PORT', 8080))
 TIMEOUT_IN_SECONDS = 30 * 60 
 
 # --- Diccionario de Clientes y Lock ---
@@ -175,7 +175,7 @@ def handle_client(conn, addr):
     terminal_id = None 
     try:
         while True:
-            data = conn.recv(2048) 
+            data = conn.recv(2080) 
             if not data: break
             print(f"  -> [TRAMA CRUDA de {addr}] {data.hex()} (ASCII: {str(data, 'latin-1', errors='ignore')})")
             try:
@@ -285,6 +285,8 @@ if __name__ == "__main__":
     tcp_thread.start()
     
     # 2. Iniciar el servidor Flask (API web) en el hilo principal.
-    #    Este es el proceso que Railway mantendrá vivo.
-    print(f"--- SERVIDOR API INICIADO en {HOST}:{API_PORT} ---")
-    app.run(host=HOST, port=API_PORT)
+    #    Railway le asignará un puerto a través de la variable de entorno $PORT.
+    #    Si no existe, usará nuestro puerto fijo 8080.
+    web_port = int(os.environ.get('PORT', API_PORT))
+    print(f"--- SERVIDOR API INICIADO en {HOST}:{web_port} ---")
+    app.run(host=HOST, port=web_port)
