@@ -40,6 +40,11 @@ COMMAND_MAP = {
     'REINICIAR': {
         'message_id_hex': '8105',
         'command_body_hex': '01'
+    },
+    # ## NUEVO COMANDO AÑADIDO ##
+    'SOLICITAR_APN': {
+        'message_id_hex': '8104', # ID estándar para "Consultar Parámetros"
+        'command_body_hex': '000000010013' # Cuerpo: 1 parámetro, ID del parámetro APN (0x0013)
     }
 }
 
@@ -194,8 +199,6 @@ def handle_client(conn, addr):
             if not data: break
             print(f"  -> [TRAMA CRUDA de {addr}] {data.hex()} (ASCII: {str(data, 'latin-1', errors='ignore')})")
             
-            # ## CORRECCIÓN 1: No silenciar errores. Procesaremos todo lo que llegue. ##
-            # El bloque try/except se mantiene para evitar que un error en una trama detenga todo el hilo.
             try:
                 processed_data = unescape_jt808(data)
                 if not processed_data or len(processed_data) < 13:
@@ -251,7 +254,6 @@ def handle_client(conn, addr):
                     time.sleep(0.5)
                     break
                 
-                # ## CORRECCIÓN 2: Añadir lógica para manejar y decodificar la respuesta 0x0001 ##
                 elif message_id == 0x0001:
                     print("    -> [Message 0x0001] Respuesta Universal del Dispositivo RECIBIDA.")
                     if len(message_body) >= 5:
@@ -265,14 +267,12 @@ def handle_client(conn, addr):
                         print(f"       [INFO] Resultado: {result_code} ({results.get(result_code, 'Desconocido')})")
                     else:
                         print(f"       [WARN] El cuerpo de la respuesta es demasiado corto para ser decodificado: {message_body.hex()}")
-                    # No necesitamos enviar un ACK a un ACK.
                 
                 else:
-                     print(f"    -> [Message {hex(message_id)}] Mensaje no manejado recibido.")
+                     print(f"    -> [Message {hex(message_id)}] Mensaje no manejado recibido. Se enviará ACK.")
                      send_ack_8001(conn, terminal_phone_number_raw, message_serial_number_raw, message_id)
 
             except Exception as e:
-                # El except ahora imprimirá el error en lugar de quedarse en silencio.
                 print(f"     [ERROR] No se pudo procesar la trama. Causa: {e}")
 
     finally:
@@ -356,4 +356,6 @@ if __name__ == "__main__":
     
     print(f"--- SERVIDOR API INICIADO en {HOST}:{API_PORT} ---")
     app.run(host=HOST, port=API_PORT)
+
+
 
