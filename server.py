@@ -10,8 +10,11 @@ import logging
 
 # --- Configuration and Constants ---
 HOST = '0.0.0.0'
-# El puerto para el servidor TCP, es interno. Railway lo expondrá a través de un puerto público.
-TCP_PORT = int(os.environ.get('TCP_PORT', 5432))
+# ==============================================================================
+# CORRECCIÓN: Cambiamos el puerto por defecto del TCP a 5433 para evitar conflictos
+# ==============================================================================
+TCP_PORT = int(os.environ.get('TCP_PORT', 5433))
+
 # El puerto para la API web. Usamos la variable 'PORT' que Railway nos da para el servicio web.
 API_PORT = int(os.environ.get('PORT', 8080))
 TIMEOUT_IN_SECONDS = 30 * 60 
@@ -284,4 +287,3 @@ if __name__ == "__main__":
     #    Este es el proceso que Railway mantendrá vivo.
     print(f"--- SERVIDOR API INICIADO en {HOST}:{API_PORT} ---")
     app.run(host=HOST, port=API_PORT)
-
