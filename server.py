@@ -11,7 +11,7 @@ import logging
 # --- Configuration and Constants ---
 HOST = '0.0.0.0'
 # ==============================================================================
-# CORRECCIÓN FINAL: Asignamos puertos internos FIJOS para cada servicio.
+# CORRECCIÓN DEFINITIVA: Puertos internos FIJOS que no cambiarán.
 # ==============================================================================
 # El servidor TCP para los dispositivos GPS escuchará SIEMPRE en el puerto 7000.
 TCP_PORT = 7000
@@ -285,8 +285,7 @@ if __name__ == "__main__":
     tcp_thread.start()
     
     # 2. Iniciar el servidor Flask (API web) en el hilo principal.
-    #    Railway le asignará un puerto a través de la variable de entorno $PORT.
-    #    Si no existe, usará nuestro puerto fijo 8080.
-    web_port = int(os.environ.get('PORT', API_PORT))
-    print(f"--- SERVIDOR API INICIADO en {HOST}:{web_port} ---")
-    app.run(host=HOST, port=web_port)
+    #    Usaremos SIEMPRE el puerto fijo API_PORT (8080). Railway lo detectará.
+    print(f"--- SERVIDOR API INICIADO en {HOST}:{API_PORT} ---")
+    app.run(host=HOST, port=API_PORT)
+
